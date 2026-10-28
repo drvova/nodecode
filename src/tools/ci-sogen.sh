@@ -316,6 +316,41 @@ EOF
   grep -q '^dump: the dumped image says 6765' "$out/dump-run.out"
 }
 
+# Quicklisp's own load, the build's first step and the first thing that broke
+# there, five ways, each with a cache of its own so each compiles quicklisp
+# from nothing: neither of the build's runtime options, each alone, both, and
+# both with the nursery at 4 GB so the load runs with next to no GC. Which of
+# them load says what the fault needs: an option, or the collector.
+stage_quicklisp() {
+  local red=0 variant name opts gc_form
+  for variant in defaults stack heap both both-nogc; do
+    gc_form='nil'
+    case "$variant" in
+      defaults) opts=() ;;
+      stack) opts=(--control-stack-size 8MB) ;;
+      heap) opts=(--dynamic-space-size 8192) ;;
+      both) opts=(--dynamic-space-size 8192 --control-stack-size 8MB) ;;
+      both-nogc)
+        opts=(--dynamic-space-size 8192 --control-stack-size 8MB)
+        gc_form='(setf (sb-ext:bytes-consed-between-gcs) (* 4 1024 1024 1024))' ;;
+    esac
+    name="ql-$variant"
+    mkdir -p "$c/cache-$variant"
+    if guest "$name" 900 XDG_CACHE_HOME="C:\\work\\cache-$variant" -- 'C:\sbcl\sbcl.exe' "${opts[@]}" \
+         --noinform --non-interactive --no-sysinit --no-userinit --eval "$gc_form" \
+         --eval '(load "C:/work/home/quicklisp/setup.lisp")' \
+         --eval '(format t "~&quicklisp-loaded, GC run time ~d~%" sb-ext:*gc-run-time*)' >/dev/null &&
+       grep -q '^quicklisp-loaded' "$out/$name.out"; then
+      echo "ci-sogen: $name: quicklisp loads ($(grep -c 0x50100000 "$out/$name.jsonl" 2>/dev/null) safepoint faults)"
+    else
+      echo "ci-sogen: $name: quicklisp does not load ($(grep -c 0x50100000 "$out/$name.jsonl" 2>/dev/null) safepoint faults):"
+      grep -m 4 -E 'Unhandled|Unknown|error|fatal' "$out/$name.out"
+      red=1
+    fi
+  done
+  [ "$red" = 0 ]
+}
+
 stage_build() {
   GUEST_CWD='C:\work\nodecode\src' guest build 5400 NODECODE_BUILD_COMMIT="$label" -- 'C:\sbcl\sbcl.exe' \
     --dynamic-space-size 8192 --control-stack-size 8MB --noinform --non-interactive \
@@ -424,6 +459,7 @@ skip() {
 
 if stage start; then
   stage dump || true
+  stage quicklisp || true
   if stage build; then
     stage seams || true
     stage serve || true
@@ -432,7 +468,7 @@ if stage start; then
   fi
 else
   red=1
-  skip dump build seams serve
+  skip dump quicklisp build seams serve
 fi
 
 {
