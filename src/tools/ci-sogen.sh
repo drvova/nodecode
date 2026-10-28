@@ -316,17 +316,15 @@ EOF
   grep -q '^dump: the dumped image says 6765' "$out/dump-run.out"
 }
 
-# What corrupts the build, asked four ways under the build's own runtime
-# options, each probe with an empty cache of its own. The five-way split of
-# quicklisp's load (run 40775546415) broke under every option set, in a
-# different compiler function each time and always on arguments read back as
-# 0: so memory goes to zeros, and no option is the cause.
-#   ql-nogc       quicklisp's load inside WITHOUT-GCING: no collection at all
-#   ql-onethread  the finalizer thread stopped first: one Lisp thread only
-#   ql-verify     SBCL checks the heap before and after every GC, naming the
-#                 first pointer into freed space and the GC that made it
-#   mem           no compiler: patterned vectors and lists, checked word by
-#                 word after each round of GCs
+# What corrupts the build. Run 40776974537 split it: quicklisp loads with no
+# GC at all (WITHOUT-GCING: 0 safepoint faults) and breaks the same way with
+# one Lisp thread, and SBCL's own heap check around every GC finds nothing --
+# so live data is lost only when GC safepoint faults are taken and resumed.
+# The memory stress run stopped in Sogen itself on its 1362nd fault ("Failed
+# to write KVM guest memory"): ~1.55 KB of exception frame per fault fills the
+# 2 MB stack sbcl.exe asks for. These two probes measure that directly:
+#   sp-drift  one frame consing through ~200 GCs, watching its own SP
+#   mem       tagged vectors and lists checked word by word through the GCs
 isolate_options=(--dynamic-space-size 8192 --control-stack-size 8MB --noinform --non-interactive --no-sysinit --no-userinit)
 isolate() { # isolate NAME FORM...: run FORMs; the probe passes when NAME's marker line is printed
   local name="$1" forms=() form
@@ -338,7 +336,7 @@ isolate() { # isolate NAME FORM...: run FORMs; the probe passes when NAME's mark
   local faults
   faults="$(grep -c 0x50100000 "$out/$name.jsonl" 2>/dev/null)"
   if grep -q "^$name-done" "$out/$name.out"; then
-    echo "ci-sogen: $name: pass ($faults safepoint faults) -- $(grep -h "^$name-done\|^mem:" "$out/$name.out" | tr '\n' ' ')"
+    echo "ci-sogen: $name: pass ($faults safepoint faults) -- $(grep -h "^$name-done\|^mem:\|^drift:" "$out/$name.out" | tr '\n' ' ')"
     return 0
   fi
   echo "ci-sogen: $name: FAIL ($faults safepoint faults):"
@@ -348,7 +346,27 @@ isolate() { # isolate NAME FORM...: run FORMs; the probe passes when NAME's mark
 
 stage_isolate() {
   local red=0
-  local load='(load "C:/work/home/quicklisp/setup.lisp")'
+  # sp-drift: one frame that conses through ~200 GCs (a 4 MB nursery, so each
+  # GC's safepoint faults land in this frame) and watches its own stack
+  # pointer. Resuming from a fault must give back the frame's stack pointer;
+  # the run that took 1362 faults in mem ran out of a 2 MB stack.
+  cat > "$c/drift.lisp" <<'EOF'
+(setf (sb-ext:bytes-consed-between-gcs) (* 4 1024 1024))
+(sb-ext:gc)
+(defun drift ()
+  (let* ((sp0 (sb-sys:sap-int (sb-kernel:current-sp))) (lo sp0) (hi sp0) (x nil))
+    (dotimes (i 50000000)
+      (setq x (cons i x))
+      (when (zerop (logand i 1023)) (setq x nil))
+      (let ((sp (sb-sys:sap-int (sb-kernel:current-sp))))
+        (when (< sp lo) (setq lo sp))
+        (when (> sp hi) (setq hi sp))))
+    (format t "~&drift: sp ~x at entry, lowest ~x, highest ~x: ~d bytes below entry~%" sp0 lo hi (- sp0 lo))))
+(compile 'drift)
+(drift)
+EOF
+  isolate sp-drift '(load "C:/work/drift.lisp")' || red=1
+  grep -q '^drift: .*: 0 bytes below entry' "$out/sp-drift.out" || red=1
   cat > "$c/mem.lisp" <<'EOF'
 (defvar *bad* 0)
 (defun check-vector (v tag)
@@ -369,10 +387,6 @@ stage_isolate() {
     (dolist (e batch) (check-vector (cdr e) (car e)))))
 (format t "~&mem: ~d bad words~%" *bad*)
 EOF
-  isolate ql-nogc "(sb-sys:without-gcing $load)" || red=1
-  isolate ql-onethread '(sb-impl::finalizer-thread-stop)' "$load" || red=1
-  isolate ql-verify '(setf (extern-alien "verify_gens" char) 0)' \
-    '(setf (extern-alien "pre_verify_gen_0" int) 1)' "$load" || red=1
   isolate mem '(load "C:/work/mem.lisp")' || red=1
   grep -q '^mem: 0 bad words' "$out/mem.out" || red=1
   [ "$red" = 0 ]
