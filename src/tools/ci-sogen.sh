@@ -168,15 +168,19 @@ guest() {
     shift
   done
   shift
+  # GUEST_TRACE=1: Sogen's own log of every syscall and exception, not just
+  # the guest's console.
+  local logging=(-s --very-concise)
+  [ "${GUEST_TRACE:-}" != 1 ] || logging=()
   timeout --kill-after=30 "$seconds" "$analyzer" --backend "$backend" -e "$root" --root-mode rw \
-    --network live -s --very-concise --report "$out/$name.jsonl" \
+    --network live "${logging[@]}" --report "$out/$name.jsonl" \
     --mount "$work/sbcl:C:\\sbcl:ro" --mount "$work/git:C:\\git:rw" --mount "$c:C:\\work:rw" \
     --env HOME 'C:\work\home' --env USERPROFILE 'C:\work\home' \
     --env TEMP 'C:\work\temp' --env TMP 'C:\work\temp' \
     --env XDG_CACHE_HOME 'C:\work\cache' --env SBCL_HOME 'C:\sbcl' \
     --env PATH 'C:\work\nodecode\src;C:\sbcl;C:\git\cmd;C:\Windows\System32;C:\Windows' \
     "${env[@]}" --working-directory "${GUEST_CWD:-C:\\work}" "$@" > "$out/$name.out" 2>&1 || rc=$?
-  sed -i 's/\r$//' "$out/$name.out"
+  sed -i 's/\r$//; s/\x1b\[[0-9;]*m//g' "$out/$name.out"
   # A build's report runs to gigabytes: its first and last events say enough.
   if [ "$(stat -c%s "$out/$name.jsonl" 2>/dev/null || echo 0)" -gt 50000000 ]; then
     { head -c 2000000 "$out/$name.jsonl"; echo; tail -c 8000000 "$out/$name.jsonl"; } > "$out/$name.jsonl.cut"
@@ -190,20 +194,85 @@ guest() {
   return 1
 }
 
+# guest_exit NAME: the exit code the guest itself returned (the analyzer's own
+# is 0 or 1), off the footer of its report.
+guest_exit() {
+  sed -n 's/.*"type":"footer".*"exit":\([0-9-]*\).*/\1/p' "$out/$1.jsonl" 2>/dev/null | tail -n 1
+}
+
+# trace NAME SECONDS [NAME=VALUE...] -- EXE ARGS...: run it again with Sogen's
+# whole log (as NAME-trace), and print what Sogen said it could not do and the
+# log up to the guest's first trap or fault.
+trace() {
+  local name="$1-trace"
+  echo "ci-sogen: $1 again with Sogen's whole log, as $name"
+  shift
+  GUEST_TRACE=1 guest "$name" "$@" >/dev/null || true
+  echo "ci-sogen: what Sogen reported it does not support, in $name:"
+  grep -i -E 'unsupported|unimplemented|not implemented|not supported|unknown|unhandled|warn' "$out/$name.out" |
+    sort | uniq -c | sort -rn | head -n 40
+  local first
+  first="$(grep -n -i -E 'breakpoint|exception|violation|illegal' "$out/$name.out" | head -n 1 | cut -d: -f1)"
+  if [ -n "$first" ]; then
+    echo "ci-sogen: $name up to its first trap (line $first):"
+    sed -n "$((first > 120 ? first - 120 : 1)),$((first + 10))p" "$out/$name.out"
+  else
+    echo "ci-sogen: the last of $name:"
+    tail -n 120 "$out/$name.out"
+  fi
+}
+
 # --- the stages ----------------------------------------------------------------
+# The image's first steps, each its own process, smallest first: the
+# runtime alone; the Lisp toplevel answering an exit code, no stream touched;
+# a file written; the console written to; a file loaded. The probes after the
+# first all run with a debugger hook that writes the condition to a file, so
+# an error is named even when the console stream is what broke. The first red
+# probe is run again with Sogen's whole log (trace).
+probe_hook='(setf sb-ext:*invoke-debugger-hook* (lambda (c h) (declare (ignore h)) (ignore-errors (with-open-file (s "C:/work/probe-error.txt" :direction :output :if-exists :append :if-does-not-exist :create) (format s "~s: ~a~%" (type-of c) c))) (sb-ext:exit :code 3 :abort t)))'
+probe_red=""
+# probe NAME CHECK [SBCL ARGS...]: one probe, judged by the shell command CHECK.
+probe() {
+  local name="$1" check="$2"
+  shift 2
+  rm -f "$c/probe-error.txt"
+  guest "$name" 300 -- 'C:\sbcl\sbcl.exe' "$@" >/dev/null || true
+  if eval "$check"; then
+    echo "ci-sogen: probe $name pass"
+    return 0
+  fi
+  echo "ci-sogen: probe $name FAIL (guest exit $(guest_exit "$name")); its console:"
+  tail -n 20 "$out/$name.out"
+  if [ -s "$c/probe-error.txt" ]; then
+    echo "ci-sogen: the condition the hook caught:"
+    cat "$c/probe-error.txt"
+    cp "$c/probe-error.txt" "$out/$name.error"
+  fi
+  if [ -z "$probe_red" ]; then
+    probe_red="$name"
+    trace "$name" 300 -- 'C:\sbcl\sbcl.exe' "$@"
+  fi
+  return 1
+}
+
 stage_start() {
-  guest sbcl-version 300 -- 'C:\sbcl\sbcl.exe' --version || return 1
-  cat "$out/sbcl-version.out"
-  grep -q "SBCL $sbcl_version" "$out/sbcl-version.out" || return 1
+  local quiet=(--noinform --no-sysinit --no-userinit --disable-debugger) red=0
   cat > "$c/start.lisp" <<'EOF'
 (format t "~&start: ~a ~a on ~a ~a~%" (lisp-implementation-type) (lisp-implementation-version)
         (software-type) (machine-type))
 (format t "~&start: (+ 1 2) = ~a~%" (+ 1 2))
 EOF
-  guest sbcl-eval 300 -- 'C:\sbcl\sbcl.exe' --noinform --non-interactive --no-sysinit --no-userinit \
-    --load 'C:\work\start.lisp' || return 1
+  probe sbcl-version 'grep -q "SBCL $sbcl_version" "$out/sbcl-version.out"' --version || red=1
+  probe sbcl-exit '[ "$(guest_exit sbcl-exit)" = 7 ]' \
+    "${quiet[@]}" --eval '(sb-ext:exit :code 7 :abort t)' || red=1
+  probe sbcl-file 'grep -qx 3 "$c/probe.txt" 2>/dev/null' "${quiet[@]}" --eval "$probe_hook" \
+    --eval '(progn (with-open-file (s "C:/work/probe.txt" :direction :output :if-exists :supersede) (princ (+ 1 2) s)) (sb-ext:exit :code 0 :abort t))' || red=1
+  probe sbcl-print 'grep -qx 3 "$out/sbcl-print.out"' "${quiet[@]}" --eval "$probe_hook" \
+    --eval '(progn (princ (+ 1 2)) (terpri) (finish-output) (sb-ext:exit :code 0))' || red=1
+  probe sbcl-eval 'grep -q "^start: (+ 1 2) = 3" "$out/sbcl-eval.out"' "${quiet[@]}" --eval "$probe_hook" \
+    --load 'C:\work\start.lisp' --eval '(sb-ext:exit :code 0)' || red=1
   cat "$out/sbcl-eval.out"
-  grep -q '^start: (+ 1 2) = 3' "$out/sbcl-eval.out"
+  [ "$red" = 0 ]
 }
 
 stage_dump() {
