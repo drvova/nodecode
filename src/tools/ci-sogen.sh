@@ -84,10 +84,12 @@ cp "$work/git/mingw64/bin/libssl-3-x64.dll" "$work/git/mingw64/bin/libcrypto-3-x
 
 # Quicklisp under the guest's home, on windows-release.lisp's own dist, with
 # every release the nodecode/bin dump reaches downloaded by the host's SBCL
-# (any version): read off the system definitions in the tree and the dist's
-# metadata. Nothing compiles here; the guest's SBCL compiles it all. A
-# dependency only Windows names (a #+win32 one the dist's Linux-computed
-# metadata leaves out) is fetched by the guest's own quickload.
+# (any version): read off the system definitions in the tree, the dist's
+# metadata, and every (:feature ...) dependency in each release's .asd files
+# whatever the feature -- the dist's metadata was computed on Linux, so a
+# Windows-only one (dexador's winhttp) is in it nowhere. Nothing compiles
+# here; the guest's SBCL compiles it all, and it reaches no network for it:
+# Sogen's live network connects, but a write on the socket fails.
 dist="$(sed -n 's|^ *"\(http://beta.quicklisp.org/dist/[^"]*\)".*|\1|p' src/tools/windows-release.lisp)"
 [ -n "$dist" ] || { echo 'ci-sogen: no quicklisp dist in windows-release.lisp' >&2; exit 1; }
 cat > "$work/prefetch.lisp" <<'EOF'
@@ -119,6 +121,19 @@ cat > "$work/prefetch.lisp" <<'EOF'
         (t nil)))
 
 (defvar *seen* (make-hash-table :test 'equal))
+(defvar *scanned* (make-hash-table :test 'equal))
+
+(defun feature-dependencies (asd)
+  "Every dependency ASD names in a (:feature ...) form, whatever the feature."
+  (let ((text (uiop:read-file-string asd)) (found '()))
+    (loop for start = (search "(:feature" text) then (search "(:feature" text :start2 (1+ start))
+          while start
+          do (let* ((form (ignore-errors
+                           (let ((*read-eval* nil) (*package* (find-package '#:sogen-prefetch)))
+                             (read-from-string text t nil :start start))))
+                    (name (and (consp form) (dependency-name form))))
+               (when name (push name found))))
+    found))
 
 (defun fetch (name)
   "Download NAME's release and every release its dependencies reach."
@@ -133,10 +148,15 @@ cat > "$work/prefetch.lisp" <<'EOF'
                             (ql-dist:find-system (asdf:primary-system-name name)))))
             (if (null system)
                 (format t "~&sogen-prefetch: ~a is in no dist (a contrib, or Windows fetches it)~%" name)
-                (progn
+                (let ((release (ql-dist:release system)))
                   (ql-dist:ensure-installed system)
                   (dolist (dependency (ql-dist:required-systems system))
-                    (fetch dependency)))))))))
+                    (fetch dependency))
+                  (unless (gethash (ql-dist:name release) *scanned*)
+                    (setf (gethash (ql-dist:name release) *scanned*) t)
+                    (dolist (asd (directory (merge-pathnames "**/*.asd" (ql-dist:base-directory release))))
+                      (dolist (dependency (feature-dependencies asd))
+                        (fetch dependency)))))))))))
 
 (fetch "nodecode/bin")
 (format t "~&sogen-prefetch: ~d releases under ~a~%"
