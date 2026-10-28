@@ -1,0 +1,76 @@
+Sogen: DEBUG ONLY -- trace the exception round trip (not for upstream)
+
+Logs the first twelve of each to stderr: the exception frame laid for a
+fault, each NtContinueEx context, and each KVM syscall return whose handler
+moved RIP. To find where a resumed thread loses its stack pointer: SBCL
+under the KVM backend runs out of a 2 MB stack after 1362 GC safepoint
+faults, 0x600 bytes per fault, as if each resume kept the frame's RSP.
+
+diff --git a/src/backends/kvm-emulator/kvm_x86_64_emulator.cpp b/src/backends/kvm-emulator/kvm_x86_64_emulator.cpp
+index f5441dd..beb9e6d 100644
+--- a/src/backends/kvm-emulator/kvm_x86_64_emulator.cpp
++++ b/src/backends/kvm-emulator/kvm_x86_64_emulator.cpp
+@@ -2261,6 +2261,16 @@ namespace sogen::kvm
+                     }
+                 }
+ 
++                {
++                    static int traced = 0;
++                    if (regs.rip != post_syscall_rcx && traced++ < 12)
++                    {
++                        fprintf(stderr, "sogen-trace sysret: continuation=%d resume.rip=%llx resume.rsp=%llx syscall.rip=%llx\n",
++                                static_cast<int>(continuation), static_cast<unsigned long long>(regs.rip),
++                                static_cast<unsigned long long>(regs.rsp), static_cast<unsigned long long>(pre_syscall_rip));
++                        fflush(stderr);
++                    }
++                }
+                 sregs = this->get_sregs();
+                 sregs.cs = make_segment(0x33, true, true);
+                 sregs.ss = make_segment(0x2B, false, true);
+diff --git a/src/windows-emulator/exception_dispatch.cpp b/src/windows-emulator/exception_dispatch.cpp
+index 38f1b3c..da14f97 100644
+--- a/src/windows-emulator/exception_dispatch.cpp
++++ b/src/windows-emulator/exception_dispatch.cpp
+@@ -109,6 +109,18 @@ namespace sogen
+ 
+             const auto initial_sp = emu.reg(x86_register::rsp);
+             const auto new_sp = align_down(initial_sp - allocation_size, 0x100);
++            {
++                static int traced = 0;
++                if (traced++ < 12)
++                {
++                    const auto& record = *reinterpret_cast<CONTEXT64*>(pointers.ContextRecord);
++                    fprintf(stderr, "sogen-trace dispatch: ctx.rip=%llx ctx.rsp=%llx live.rsp=%llx frame=%llx flags=%x\n",
++                            static_cast<unsigned long long>(record.Rip), static_cast<unsigned long long>(record.Rsp),
++                            static_cast<unsigned long long>(initial_sp), static_cast<unsigned long long>(new_sp),
++                            static_cast<unsigned>(record.ContextFlags));
++                    fflush(stderr);
++                }
++            }
+ 
+             const auto total_size = initial_sp - new_sp;
+             assert(total_size >= allocation_size);
+diff --git a/src/windows-emulator/syscalls/thread.cpp b/src/windows-emulator/syscalls/thread.cpp
+index 16ec68c..393537d 100644
+--- a/src/windows-emulator/syscalls/thread.cpp
++++ b/src/windows-emulator/syscalls/thread.cpp
+@@ -1025,7 +1025,18 @@ namespace sogen
+             }
+             else
+             {
+-                cpu_context::restore(c.x64_cpu(), c.emu.read_memory<CONTEXT64>(thread_context));
++                const auto context = c.emu.read_memory<CONTEXT64>(thread_context);
++                static int traced = 0;
++                if (traced++ < 12)
++                {
++                    fprintf(stderr, "sogen-trace continue: ctx.rip=%llx ctx.rsp=%llx flags=%x arg=%llx live.rip=%llx live.rsp=%llx\n",
++                            static_cast<unsigned long long>(context.Rip), static_cast<unsigned long long>(context.Rsp),
++                            static_cast<unsigned>(context.ContextFlags), static_cast<unsigned long long>(continue_argument),
++                            static_cast<unsigned long long>(c.x64_cpu().reg(x86_register::rip)),
++                            static_cast<unsigned long long>(c.x64_cpu().reg(x86_register::rsp)));
++                    fflush(stderr);
++                }
++                cpu_context::restore(c.x64_cpu(), context);
+             }
+ 
+             if (argument.ContinueFlags & KCONTINUE_FLAG_TEST_ALERT)
