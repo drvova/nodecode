@@ -316,13 +316,11 @@ EOF
   grep -q '^dump: the dumped image says 6765' "$out/dump-run.out"
 }
 
-# What corrupts the build. Run 40776974537 split it: quicklisp loads with no
-# GC at all (WITHOUT-GCING: 0 safepoint faults) and breaks the same way with
-# one Lisp thread, and SBCL's own heap check around every GC finds nothing --
-# so live data is lost only when GC safepoint faults are taken and resumed.
-# The memory stress run stopped in Sogen itself on its 1362nd fault ("Failed
-# to write KVM guest memory"): ~1.55 KB of exception frame per fault fills the
-# 2 MB stack sbcl.exe asks for. These two probes measure that directly:
+# The fault that corrupted the build, kept as a check. A GC safepoint fault
+# (a read of the page SBCL's GC protects) exits Sogen's KVM backend as MMIO;
+# until patch 0003 the dispatched exception lost its RIP and kept its RSP,
+# so no handler ran and each fault cost a 0x600-byte exception frame -- the
+# 2 MB stack was gone at the 1362nd, and the build read zeroed frames.
 #   sp-drift  one frame consing through ~200 GCs, watching its own SP
 #   mem       tagged vectors and lists checked word by word through the GCs
 isolate_options=(--dynamic-space-size 8192 --control-stack-size 8MB --noinform --non-interactive --no-sysinit --no-userinit)
@@ -367,14 +365,6 @@ stage_isolate() {
 EOF
   isolate sp-drift '(load "C:/work/drift.lisp")' || red=1
   grep -q '^drift: .*: 0 bytes below entry' "$out/sp-drift.out" || red=1
-  # The same run under Sogen's whole log. What the guest does between one
-  # safepoint fault and the next is how the fault was resumed: an NtContinue,
-  # a context set some other way, or nothing Sogen sees at all.
-  GUEST_TRACE=1 guest sp-drift-trace 300 XDG_CACHE_HOME='C:\work\cache-sp-drift' -- 'C:\sbcl\sbcl.exe' \
-    "${isolate_options[@]}" --eval '(load "C:/work/drift.lisp")' >/dev/null || true
-  echo "ci-sogen: sp-drift-trace from the first safepoint fault through the third:"
-  awk '/Protection violation/ {n++} n>=1 && n<=3 {print} n>3 {exit}' "$out/sp-drift-trace.out" | head -n 400
-  head -n 20000 "$out/sp-drift-trace.out" > "$out/sp-drift-trace.out.head" && mv "$out/sp-drift-trace.out.head" "$out/sp-drift-trace.out"
   cat > "$c/mem.lisp" <<'EOF'
 (defvar *bad* 0)
 (defun check-vector (v tag)
