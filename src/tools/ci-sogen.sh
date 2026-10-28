@@ -367,6 +367,14 @@ stage_isolate() {
 EOF
   isolate sp-drift '(load "C:/work/drift.lisp")' || red=1
   grep -q '^drift: .*: 0 bytes below entry' "$out/sp-drift.out" || red=1
+  # The same run under Sogen's whole log. What the guest does between one
+  # safepoint fault and the next is how the fault was resumed: an NtContinue,
+  # a context set some other way, or nothing Sogen sees at all.
+  GUEST_TRACE=1 guest sp-drift-trace 300 XDG_CACHE_HOME='C:\work\cache-sp-drift' -- 'C:\sbcl\sbcl.exe' \
+    "${isolate_options[@]}" --eval '(load "C:/work/drift.lisp")' >/dev/null || true
+  echo "ci-sogen: sp-drift-trace from the first safepoint fault through the third:"
+  awk '/Protection violation/ {n++} n>=1 && n<=3 {print} n>3 {exit}' "$out/sp-drift-trace.out" | head -n 400
+  head -n 20000 "$out/sp-drift-trace.out" > "$out/sp-drift-trace.out.head" && mv "$out/sp-drift-trace.out.head" "$out/sp-drift-trace.out"
   cat > "$c/mem.lisp" <<'EOF'
 (defvar *bad* 0)
 (defun check-vector (v tag)
