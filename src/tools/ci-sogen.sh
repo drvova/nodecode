@@ -316,38 +316,65 @@ EOF
   grep -q '^dump: the dumped image says 6765' "$out/dump-run.out"
 }
 
-# Quicklisp's own load, the build's first step and the first thing that broke
-# there, five ways, each with a cache of its own so each compiles quicklisp
-# from nothing: neither of the build's runtime options, each alone, both, and
-# both with the nursery at 4 GB so the load runs with next to no GC. Which of
-# them load says what the fault needs: an option, or the collector.
-stage_quicklisp() {
-  local red=0 variant name opts gc_form
-  for variant in defaults stack heap both both-nogc; do
-    gc_form='nil'
-    case "$variant" in
-      defaults) opts=() ;;
-      stack) opts=(--control-stack-size 8MB) ;;
-      heap) opts=(--dynamic-space-size 8192) ;;
-      both) opts=(--dynamic-space-size 8192 --control-stack-size 8MB) ;;
-      both-nogc)
-        opts=(--dynamic-space-size 8192 --control-stack-size 8MB)
-        gc_form='(setf (sb-ext:bytes-consed-between-gcs) (* 4 1024 1024 1024))' ;;
-    esac
-    name="ql-$variant"
-    mkdir -p "$c/cache-$variant"
-    if guest "$name" 900 XDG_CACHE_HOME="C:\\work\\cache-$variant" -- 'C:\sbcl\sbcl.exe' "${opts[@]}" \
-         --noinform --non-interactive --no-sysinit --no-userinit --eval "$gc_form" \
-         --eval '(load "C:/work/home/quicklisp/setup.lisp")' \
-         --eval '(format t "~&quicklisp-loaded, GC run time ~d~%" sb-ext:*gc-run-time*)' >/dev/null &&
-       grep -q '^quicklisp-loaded' "$out/$name.out"; then
-      echo "ci-sogen: $name: quicklisp loads ($(grep -c 0x50100000 "$out/$name.jsonl" 2>/dev/null) safepoint faults)"
-    else
-      echo "ci-sogen: $name: quicklisp does not load ($(grep -c 0x50100000 "$out/$name.jsonl" 2>/dev/null) safepoint faults):"
-      grep -m 4 -E 'Unhandled|Unknown|error|fatal' "$out/$name.out"
-      red=1
-    fi
-  done
+# What corrupts the build, asked four ways under the build's own runtime
+# options, each probe with an empty cache of its own. The five-way split of
+# quicklisp's load (run 40775546415) broke under every option set, in a
+# different compiler function each time and always on arguments read back as
+# 0: so memory goes to zeros, and no option is the cause.
+#   ql-nogc       quicklisp's load inside WITHOUT-GCING: no collection at all
+#   ql-onethread  the finalizer thread stopped first: one Lisp thread only
+#   ql-verify     SBCL checks the heap before and after every GC, naming the
+#                 first pointer into freed space and the GC that made it
+#   mem           no compiler: patterned vectors and lists, checked word by
+#                 word after each round of GCs
+isolate_options=(--dynamic-space-size 8192 --control-stack-size 8MB --noinform --non-interactive --no-sysinit --no-userinit)
+isolate() { # isolate NAME FORM...: run FORMs; the probe passes when NAME's marker line is printed
+  local name="$1" forms=() form
+  shift
+  for form in "$@"; do forms+=(--eval "$form"); done
+  mkdir -p "$c/cache-$name"
+  guest "$name" 900 XDG_CACHE_HOME="C:\\work\\cache-$name" -- 'C:\sbcl\sbcl.exe' "${isolate_options[@]}" \
+    "${forms[@]}" --eval "(format t \"~&$name-done, GC run time ~d~%\" sb-ext:*gc-run-time*)" >/dev/null || true
+  local faults
+  faults="$(grep -c 0x50100000 "$out/$name.jsonl" 2>/dev/null)"
+  if grep -q "^$name-done" "$out/$name.out"; then
+    echo "ci-sogen: $name: pass ($faults safepoint faults) -- $(grep -h "^$name-done\|^mem:" "$out/$name.out" | tr '\n' ' ')"
+    return 0
+  fi
+  echo "ci-sogen: $name: FAIL ($faults safepoint faults):"
+  grep -m 8 -E 'Unhandled|Unknown|error|fatal|Ptr|junk|sees|verify|corrupt|^mem:|^0: ' "$out/$name.out"
+  return 1
+}
+
+stage_isolate() {
+  local red=0
+  local load='(load "C:/work/home/quicklisp/setup.lisp")'
+  cat > "$c/mem.lisp" <<'EOF'
+(defvar *bad* 0)
+(defun check-vector (v tag)
+  (loop for x across v unless (eql x tag) do (incf *bad*)))
+(let ((keep '()))
+  (dotimes (round 60)
+    (push (loop for i below 50
+                collect (let ((tag (+ (* round 100) i)))
+                          (cons tag (make-array 16384 :initial-element tag))))
+          keep)
+    (when (> (length keep) 10) (setf keep (subseq keep 0 10)))
+    (let ((l (loop for i below 200000 collect (cons i (* 2 i)))))
+      (loop for (a . b) in l unless (eql b (* 2 a)) do (incf *bad*)))
+    (dolist (batch keep)
+      (dolist (e batch) (check-vector (cdr e) (car e)))))
+  (sb-ext:gc :full t)
+  (dolist (batch keep)
+    (dolist (e batch) (check-vector (cdr e) (car e)))))
+(format t "~&mem: ~d bad words~%" *bad*)
+EOF
+  isolate ql-nogc "(sb-sys:without-gcing $load)" || red=1
+  isolate ql-onethread '(sb-impl::finalizer-thread-stop)' "$load" || red=1
+  isolate ql-verify '(setf (extern-alien "verify_gens" char) 0)' \
+    '(setf (extern-alien "pre_verify_gen_0" int) 1)' "$load" || red=1
+  isolate mem '(load "C:/work/mem.lisp")' || red=1
+  grep -q '^mem: 0 bad words' "$out/mem.out" || red=1
   [ "$red" = 0 ]
 }
 
@@ -459,7 +486,7 @@ skip() {
 
 if stage start; then
   stage dump || true
-  stage quicklisp || true
+  stage isolate || true
   if stage build; then
     stage seams || true
     stage serve || true
@@ -468,7 +495,7 @@ if stage start; then
   fi
 else
   red=1
-  skip dump quicklisp build seams serve
+  skip dump isolate build seams serve
 fi
 
 {
