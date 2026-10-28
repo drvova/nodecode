@@ -1,0 +1,133 @@
+name: Sogen
+
+# A spike, not a gate: can the Windows release's guest half run under Sogen
+# (github.com/momo5502/sogen) on a Linux runner, with no Windows VM at all?
+# src/tools/ci-sogen.sh runs it in stages, from sbcl.exe starting up to
+# nodecode.exe's platform seams and a headless serve, and writes a table of
+# the stages to the job summary. GitHub's Linux runners expose /dev/kvm, so
+# Sogen's KVM backend runs the guest's code on the runner's own CPU.
+#
+# Only GitHub-hosted runners: nothing here reaches the self-hosted machines
+# ci.yml and release.yml use.
+on:
+  push:
+    branches: ['claude/**']
+    paths:
+      - .github/workflows/sogen.yml
+      - src/tools/ci-sogen.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sogen-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Sogen's main when the spike was written; the build cache is keyed on it.
+  SOGEN_REV: fc48aaa1ace15f8a2affa1412334eacc22ba1183
+
+jobs:
+  sogen:
+    name: Windows release under Sogen
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      # Saved right after the build, not at the job's end: a red stage fails
+      # the job, and the next run should not build Sogen again for it.
+      - name: Restore the Sogen build
+        id: sogen
+        uses: actions/cache/restore@v4
+        with:
+          path: sogen-bin
+          key: sogen-bin-${{ env.SOGEN_REV }}-kvm-v1
+
+      - name: Check out Sogen
+        if: steps.sogen.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: momo5502/sogen
+          ref: ${{ env.SOGEN_REV }}
+          submodules: recursive
+          path: sogen
+
+      # Sogen's own Linux lane builds with Clang 22 from apt.llvm.org.
+      - name: Install Clang 22
+        if: steps.sogen.outputs.cache-hit != 'true'
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 22
+          sudo apt-get install -y --no-install-recommends clang-22 lld-22
+
+      # The analyzer alone, without the parts a headless KVM run never uses:
+      # the Rust backend (icicle), the Steam bridge and the SDL3 UI.
+      - name: Build Sogen's analyzer
+        if: steps.sogen.outputs.cache-hit != 'true'
+        working-directory: sogen
+        env:
+          CC: clang-22
+          CXX: clang++-22
+        run: |
+          cmake --preset=release -DSOGEN_ENABLE_RUST_CODE=OFF -DSOGEN_ENABLE_STEAM=OFF -DSOGEN_ENABLE_SDL3=OFF
+          cmake --build --preset=release --target analyzer
+          mkdir -p ../sogen-bin
+          cp -a build/release/artifacts/. ../sogen-bin/
+          ls -la ../sogen-bin
+
+      - name: Save the Sogen build
+        if: steps.sogen.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: sogen-bin
+          key: ${{ steps.sogen.outputs.cache-primary-key }}
+
+      # The ready-made root Sogen's README names: the system DLLs and a
+      # registry dump of a real Windows install.
+      - name: Restore the emulation root
+        id: root
+        uses: actions/cache/restore@v4
+        with:
+          path: sogen-root.zip
+          key: sogen-root-${{ env.SOGEN_REV }}-v1
+
+      - name: Download the emulation root
+        if: steps.root.outputs.cache-hit != 'true'
+        run: curl -fsSL --retry 3 -o sogen-root.zip https://sogen.dev/root.zip
+
+      - name: Save the emulation root
+        if: steps.root.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: sogen-root.zip
+          key: ${{ steps.root.outputs.cache-primary-key }}
+
+      - name: Install the host tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends msitools sbcl p7zip-full unzip
+
+      - name: Run the release's guest half under Sogen
+        run: |
+          unzip -q sogen-root.zip -d sogen-root
+          filesys="$(find "$PWD/sogen-root" -maxdepth 3 -type d -name filesys | head -n 1)"
+          [ -n "$filesys" ] || { echo 'no filesys/ in the emulation root'; find sogen-root -maxdepth 2; exit 1; }
+          src/tools/ci-sogen.sh sogen-bin/analyzer "$(dirname "$filesys")" dist/sogen
+
+      - name: Upload the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sogen-logs
+          path: dist/sogen
+          retention-days: 14
