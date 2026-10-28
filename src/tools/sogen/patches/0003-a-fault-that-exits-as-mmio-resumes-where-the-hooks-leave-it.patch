@@ -1,0 +1,80 @@
+Sogen (KVM): a fault that exits as MMIO resumes where the hooks leave it
+
+The KVM backend leaves a page protected to no access out of every memslot,
+so a guest read of it does not fault in the guest: it exits as MMIO, with
+the instruction half executed. handle_mmio_exit hands such an exit to the
+memory violation hooks, and the Windows emulator's hook dispatches an
+access violation -- RSP to the exception frame, RIP to
+KiUserExceptionDispatcher -- and the loop goes back into KVM_RUN. But KVM
+completes a pending MMIO access on that next KVM_RUN, and completing it
+writes back the instruction's own next RIP. The dispatcher's RIP was lost
+and its RSP kept: the guest went on after the faulting instruction, on the
+exception frame's stack, and no handler ever ran.
+
+A runtime whose GC stops threads by protecting a page meets it at once.
+SBCL's Windows build polls such a page; under Sogen every poll after the
+first faulted again (the handler that would unprotect it never ran), each
+one cost the 0x600 bytes of an exception frame, and after 1362 faults the
+2 MB stack sbcl.exe asks for was gone ("Failed to write KVM guest
+memory"). Before that, code reading its stack slots read the frames Sogen
+had zeroed: the nodecode build died on calls whose arguments came back 0.
+Sogen's own log shows it: no syscall at all between one fault and the
+next, and each fault's RSP the previous fault's frame.
+
+abandon_pending_mmio finishes the access before the hooks run, by a
+KVM_RUN with immediate_exit set (KVM's documented way to complete pending
+operations without executing anything further), then puts back the
+registers, segment registers and XSAVE state the completion changed. The
+hooks see the faulting instruction, and the guest resumes where they
+leave it. A real MMIO region's access still completes as before.
+
+diff --git a/src/backends/kvm-emulator/kvm_x86_64_emulator.cpp b/src/backends/kvm-emulator/kvm_x86_64_emulator.cpp
+index f5441dd..ba3dbee 100644
+--- a/src/backends/kvm-emulator/kvm_x86_64_emulator.cpp
++++ b/src/backends/kvm-emulator/kvm_x86_64_emulator.cpp
+@@ -2003,6 +2003,37 @@ namespace sogen::kvm
+                 return std::nullopt;
+             }
+ 
++            // A guest access to a page no memslot backs (one protected to no access) or a write to a read-only
++            // memslot exits as MMIO with its instruction half executed, and KVM finishes that instruction on the
++            // next KVM_RUN: it moves RIP past it whatever the registers were set to in between. A violation hook
++            // that dispatches an exception from that exit would have its RIP dropped and its RSP kept, so the
++            // guest went on after the faulting instruction on the dispatcher's stack -- never running the handler,
++            // and losing the exception frame's worth of stack each time. Finish the access now without running
++            // the guest (immediate_exit), and put back the faulting state it changed, so the hooks see the
++            // faulting instruction and the guest resumes where they leave it.
++            void abandon_pending_mmio()
++            {
++                const auto regs = this->get_regs();
++                const auto sregs = this->get_sregs();
++                const auto xsave = this->get_xsave();
++
++                // No host page backs the access: it reads zeros, and a write goes nowhere.
++                std::memset(this->run_->mmio.data, 0, sizeof(this->run_->mmio.data));
++                this->run_->immediate_exit = 1;
++                const auto rc = ::ioctl(this->vcpu_fd_.get(), KVM_RUN, 0);
++                const auto run_errno = errno;
++                this->run_->immediate_exit = this->stop_requested_ ? 1 : 0;
++                this->invalidate_register_cache();
++                if (rc >= 0 || run_errno != EINTR)
++                {
++                    throw std::runtime_error("KVM did not finish a pending MMIO access");
++                }
++
++                this->set_regs(regs);
++                this->set_sregs(sregs);
++                this->set_xsave(xsave);
++            }
++
+             bool handle_mmio_exit()
+             {
+                 const auto& mmio = this->run_->mmio;
+@@ -2026,6 +2057,7 @@ namespace sogen::kvm
+                 const auto violation_address = translated_guest_address.value_or(mmio.phys_addr);
+                 const auto violation_type = translated_guest_address ? memory_violation_type::protection : memory_violation_type::unmapped;
+                 const auto operation = mmio.is_write ? memory_operation::write : memory_operation::read;
++                this->abandon_pending_mmio();
+                 for (auto& [_, hook] : this->memory_violation_hooks_)
+                 {
+                     const auto result = hook(*this, violation_address, mmio.len, operation, violation_type);
