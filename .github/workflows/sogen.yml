@@ -15,6 +15,7 @@ on:
     paths:
       - .github/workflows/sogen.yml
       - src/tools/ci-sogen.sh
+      - src/tools/sogen/patches/**
   workflow_dispatch:
 
 permissions:
@@ -50,7 +51,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: sogen-bin
-          key: sogen-bin-${{ env.SOGEN_REV }}-kvm-v1
+          key: sogen-bin-${{ env.SOGEN_REV }}-${{ hashFiles('src/tools/sogen/patches/*.patch') }}-kvm-v1
 
       - name: Check out Sogen
         if: steps.sogen.outputs.cache-hit != 'true'
@@ -60,6 +61,16 @@ jobs:
           ref: ${{ env.SOGEN_REV }}
           submodules: recursive
           path: sogen
+
+      # What this spike found Sogen getting wrong, fixed on top of the pin;
+      # each patch says what a guest saw before it.
+      - name: Apply nodecode's Sogen patches
+        if: steps.sogen.outputs.cache-hit != 'true'
+        run: |
+          for patch in src/tools/sogen/patches/*.patch; do
+            echo "sogen: applying $(basename "$patch")"
+            git -C sogen apply "$PWD/$patch"
+          done
 
       # Sogen's own Linux lane builds with Clang 22 from apt.llvm.org.
       - name: Install Clang 22
