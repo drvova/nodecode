@@ -1,0 +1,69 @@
+Sogen: Xmm0-15 and MxCsr travel with CONTEXT_FLOATING_POINT
+
+cpu_context::save and restore moved Xmm0-15 and MxCsr only under
+CONTEXT_XSTATE. On x64 they are CONTEXT_FLOATING_POINT's: the SSE registers
+overlay the legacy save area (FltSave), and CONTEXT_XSTATE adds only the AVX
+state beyond them. An exception is dispatched with CONTEXT64_ALL, which has
+FLOATING_POINT and not XSTATE, so its context carried no XMM registers and
+the NtContinue that resumed the faulting code restored none: the code went on
+with whatever XMM values the handler had left.
+
+A runtime that resumes after faults on purpose meets that at once. SBCL's
+Windows GC stops a thread by protecting its safepoint page, so every poll
+faults and resumes; building nodecode, the main thread took 862 such faults
+at 0x50100000 in 72 seconds, and the compiler then failed on arguments no
+correct run produces:
+
+  Unhandled SB-EXT:UNKNOWN-KEYWORD-ARGUMENT: Unknown &KEY argument: 0
+  0: (SB-C::OPERAND-RESTRICTION-OK * #<SB-C:PRIMITIVE-TYPE :NAME T> 0 0)
+
+Both directions now take the SSE state under either flag, and save fills
+FltSave.MxCsr as Windows does. Every context the emulator builds itself
+(thread start, APC, exception) is saved from live registers whose MXCSR is
+set first, so none restores a zero MXCSR.
+
+diff --git a/src/windows-emulator/cpu_context.cpp b/src/windows-emulator/cpu_context.cpp
+index edad0b4..9df55f2 100644
+--- a/src/windows-emulator/cpu_context.cpp
++++ b/src/windows-emulator/cpu_context.cpp
+@@ -6,6 +6,19 @@ namespace sogen
+ 
+     namespace cpu_context
+     {
++        namespace
++        {
++            // On x64, Xmm0-15 and MxCsr are CONTEXT_FLOATING_POINT's, with the x87 area they overlay (FltSave);
++            // CONTEXT_XSTATE adds only the AVX state beyond them. Read under CONTEXT_XSTATE alone, they were
++            // in no context an exception is dispatched with (CONTEXT64_ALL), so the NtContinue that resumes
++            // the faulting code left it whatever XMM values the handler had put there.
++            bool carries_sse_state(const CONTEXT64& context)
++            {
++                return (context.ContextFlags & CONTEXT_FLOATING_POINT_64) == CONTEXT_FLOATING_POINT_64 ||
++                       (context.ContextFlags & CONTEXT_XSTATE_64) == CONTEXT_XSTATE_64;
++            }
++        }
++
+         void restore(x86_64_cpu& emu, const CONTEXT64& context)
+         {
+             if ((context.ContextFlags & CONTEXT_DEBUG_REGISTERS_64) == CONTEXT_DEBUG_REGISTERS_64)
+@@ -69,7 +82,7 @@ namespace sogen
+                 }
+             }
+ 
+-            if ((context.ContextFlags & CONTEXT_XSTATE_64) == CONTEXT_XSTATE_64)
++            if (carries_sse_state(context))
+             {
+                 emu.reg<uint32_t>(x86_register::mxcsr, context.MxCsr);
+ 
+@@ -141,9 +154,10 @@ namespace sogen
+                 }
+             }
+ 
+-            if ((context.ContextFlags & CONTEXT_XSTATE_64) == CONTEXT_XSTATE_64)
++            if (carries_sse_state(context))
+             {
+                 context.MxCsr = emu.reg<uint32_t>(x86_register::mxcsr);
++                context.FltSave.MxCsr = context.MxCsr;
+                 for (int i = 0; i < 16; i++)
+                 {
+                     const auto reg = static_cast<x86_register>(static_cast<int>(x86_register::xmm0) + i);
