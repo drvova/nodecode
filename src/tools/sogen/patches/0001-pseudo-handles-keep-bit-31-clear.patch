@@ -1,0 +1,41 @@
+Sogen: pseudo handles keep bit 31 clear
+
+Sogen's pseudo handles set bit 31 (handle_value.is_pseudo), and the standard
+handles are pseudo ones: the process parameters carry stdout as 0x80800008
+and stdin as 0x8080000C. No handle a Windows process holds looks like that;
+each is a small positive value whose low 32 bits are all that is significant.
+SBCL's Windows runtime holds the standard handles in Lisp as an INDEX (a
+non-negative fixnum) and passes them to C as an int (signed 32 bits), so
+neither form of the value passes:
+
+  zero-extended (Sogen as it is), at the first write to the console:
+    TYPE-ERROR: The value 2155872264 is not of type (SIGNED-BYTE 32)
+    when binding SB-ALIEN::VALUE
+  sign-extended, before the Lisp toplevel is up:
+    Internal error #116 "Object is not of type INDEX."
+    ... odd fixnum: -2139095028
+    internal error too early in init, can't recover
+
+is_pseudo and is_system trade places, so a pseudo handle is a positive 32-bit
+value, the same zero- or sign-extended. Nothing in the emulator reads
+is_system (make_handle sets it false), and nothing names a handle bit by its
+position: every pseudo handle is made by make_pseudo_handle and told by its
+is_pseudo field.
+
+diff --git a/src/windows-emulator/handles.hpp b/src/windows-emulator/handles.hpp
+index 18d6092..0c4402a 100644
+--- a/src/windows-emulator/handles.hpp
++++ b/src/windows-emulator/handles.hpp
+@@ -55,8 +55,11 @@ namespace sogen
+         uint64_t reserved : 2;
+         uint64_t id : 21;
+         uint64_t type : 7;
+-        uint64_t is_system : 1;
++        // Bit 31 stays clear. The standard handles are pseudo ones, and a guest sees them: on Windows every
++        // handle a process holds is a small positive value whose low 32 bits are all that is significant,
++        // and a runtime may keep one in a signed 32-bit int (SBCL's does, and rejects a negative one too).
+         uint64_t is_pseudo : 1;
++        uint64_t is_system : 1;
+         uint64_t high_bits : 32;
+     };
+ 
