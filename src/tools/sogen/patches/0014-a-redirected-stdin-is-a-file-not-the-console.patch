@@ -1,0 +1,80 @@
+Sogen: a redirected stdin is a file, not the console
+
+The guest's stdin was the console whatever the host's: FILE_TYPE_CHAR
+to GetFileType, a console to GetConsoleMode. A program that reads a
+console stdin with ReadConsole -- SBCL does -- reads nothing under
+Sogen, whose console serves no ReadConsole, and a console has no end
+of input to stop at in any case. On Windows a redirected stdin is the
+file or pipe it was redirected from, read with ReadFile to its end.
+
+nodecode's trial verb reads its form from stdin to its end, piped in
+as release-windows.ps1 pipes it; under Sogen every trial waited out its
+deadline with no answer, starting a thread every few seconds.
+
+When the host's stdin is not a terminal, the guest's is now a disk file
+to GetFileType and the console's requests on it fail, as they fail on a
+file; its reads go through NtReadFile, which Sogen serves from the
+host's stdin to its end.
+
+diff --git a/src/emulator-platform/platform/console_backend.hpp b/src/emulator-platform/platform/console_backend.hpp
+index 716843e..a17d46c 100644
+--- a/src/emulator-platform/platform/console_backend.hpp
++++ b/src/emulator-platform/platform/console_backend.hpp
+@@ -62,6 +62,13 @@ namespace sogen
+         {
+             return {};
+         }
++
++        // Whether the host's stdin is a terminal; a backend that cannot tell says it is. The guest's stdin is
++        // the console only then: redirected, it is a file, which reads to an end, where a console never does.
++        virtual bool input_is_terminal() const
++        {
++            return true;
++        }
+     };
+ 
+     class null_console_backend final : public console_backend
+diff --git a/src/windows-emulator/console_backends/posix_console_backend.cpp b/src/windows-emulator/console_backends/posix_console_backend.cpp
+index 0272248..736ff62 100644
+--- a/src/windows-emulator/console_backends/posix_console_backend.cpp
++++ b/src/windows-emulator/console_backends/posix_console_backend.cpp
+@@ -37,6 +37,11 @@ namespace sogen
+                 buffered_console_backend::reset();
+             }
+ 
++            bool input_is_terminal() const override
++            {
++                return isatty(STDIN_FILENO) != 0;
++            }
++
+           protected:
+             void refill(const int timeout_ms) override
+             {
+diff --git a/src/windows-emulator/syscalls.cpp b/src/windows-emulator/syscalls.cpp
+index ce00dd6..330ce71 100644
+--- a/src/windows-emulator/syscalls.cpp
++++ b/src/windows-emulator/syscalls.cpp
+@@ -1078,7 +1078,8 @@ namespace sogen
+                                               const ULONG output_buffer_length)
+         {
+             auto resolved_file_handle = c.proc.resolve_object_pseudo_handle(file_handle, c.vcpu.active_thread);
+-            if (file_handle == STDIN_HANDLE || file_handle == STDOUT_HANDLE)
++            // A redirected stdin is no console: the console's requests on it fail, as on Windows.
++            if (file_handle == STDOUT_HANDLE || (file_handle == STDIN_HANDLE && c.win_emu.console().input_is_terminal()))
+             {
+                 resolved_file_handle = c.proc.console_handle;
+             }
+diff --git a/src/windows-emulator/syscalls/file.cpp b/src/windows-emulator/syscalls/file.cpp
+index 12aa141..78d4b93 100644
+--- a/src/windows-emulator/syscalls/file.cpp
++++ b/src/windows-emulator/syscalls/file.cpp
+@@ -362,7 +362,8 @@ namespace sogen
+                             info.DeviceType = FILE_DEVICE_NAMED_PIPE;
+                             info.Characteristics = 0;
+                         }
+-                        else if (file_handle == STDOUT_HANDLE || file_handle == STDIN_HANDLE || file_handle == CONSOLE_HANDLE)
++                        else if (file_handle == STDOUT_HANDLE || file_handle == CONSOLE_HANDLE ||
++                                 (file_handle == STDIN_HANDLE && c.win_emu.console().input_is_terminal()))
+                         {
+                             info.DeviceType = FILE_DEVICE_CONSOLE;
+                             info.Characteristics = 0x20000;

@@ -402,6 +402,20 @@ isolate() { # isolate NAME FORM...: run FORMs; the probe passes when NAME's mark
 
 stage_isolate() {
   local red=0
+  # stdin: the trial verb reads its form from stdin to its end, piped in as
+  # release-windows.ps1 pipes it. A guest whose stdin is the console reads no
+  # end (patch 0014): the seams' every trial waited out its deadline.
+  printf '(+ 1 2)\n' > "$out/stdin.form"
+  guest stdin 120 -- 'C:\sbcl\sbcl.exe' "${isolate_options[@]}" \
+    --eval '(format t "~&stdin: ~s~%" (with-output-to-string (s) (loop for line = (read-line *standard-input* nil) while line do (write-line line s))))' \
+    < "$out/stdin.form" > /dev/null || true
+  if grep -q '^stdin: "(+ 1 2)' "$out/stdin.out"; then
+    echo "ci-sogen: stdin: pass"
+  else
+    echo "ci-sogen: stdin: FAIL"
+    grep -v '^Null-pointer call to ' "$out/stdin.out" | tail -n 10
+    red=1
+  fi
   # sp-drift: one frame that conses through ~200 GCs (a 4 MB nursery, so each
   # GC's safepoint faults land in this frame) and watches its own stack
   # pointer. Resuming from a fault must give back the frame's stack pointer;
@@ -750,7 +764,9 @@ stage_seams() {
   local red=0
   printf '%s\n' new > "$c/temp/from.txt"
   printf '%s\n' old > "$c/temp/to.txt"
-  trial '(+ 1 2)' 3 || red=1
+  # The other trials boot as this one does: when it answers nothing, they
+  # would each wait out their deadline the same way.
+  trial '(+ 1 2)' 3 || return 1
   trial '(progn (nlk::hand-over-to-published-image) 1)' 1 || red=1
   # what the image reopens at start is the files beside it, not a PATH's
   trial '(+ 2 3)' 5 PATH='C:\Windows\System32;C:\Windows' || red=1
