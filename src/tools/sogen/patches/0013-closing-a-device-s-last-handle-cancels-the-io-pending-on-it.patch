@@ -1,0 +1,32 @@
+Sogen: closing a device's last handle cancels the I/O pending on it
+
+When a file's last handle closes, Windows sends its device
+IRP_MJ_CLEANUP, and the device completes every request still pending
+on the file; for a socket afd.sys completes them cancelled. Sogen did
+that for named pipes alone. A socket closed under a pending receive
+dropped the request: its event was never signaled and the thread
+waiting on it waited for good.
+
+warm.lisp closes its WebSocket client's connection while the client's
+read thread is in a ReadFile on the socket; the read thread never woke,
+and the dump that follows refused to run with it alive ("Cannot save
+core with multiple threads running").
+
+Every device's pending requests now end with its file's last handle.
+Only named pipes and AFD endpoints keep requests pending.
+
+diff --git a/src/windows-emulator/syscalls/object.cpp b/src/windows-emulator/syscalls/object.cpp
+index 3c34a52..e88325c 100644
+--- a/src/windows-emulator/syscalls/object.cpp
++++ b/src/windows-emulator/syscalls/object.cpp
+@@ -92,7 +92,9 @@ namespace sogen
+                 auto* device = c.proc.devices.get(h);
+                 if (device && device->ref_count == 1)
+                 {
+-                    if (device->is_last_file_reference() && device->get_internal_device<named_pipe>())
++                    // The file's last handle ends the I/O still pending on it, as IRP_MJ_CLEANUP does: its
++                    // waiters see the requests cancelled instead of waiting on what nothing will complete.
++                    if (device->is_last_file_reference())
+                     {
+                         device->cancel_io(c.win_emu, 0);
+                     }
