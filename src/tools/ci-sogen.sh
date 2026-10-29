@@ -570,6 +570,97 @@ EOF
   [ "$red" = 0 ]
 }
 
+# sockets: the build's dexador uses its socket backend under Sogen, and
+# warm.lisp's attach is a round trip to the image's own gateway. Its parts,
+# each bounded, with a watchdog naming the step every 30 seconds: dexador
+# GETs a server on the runner; hunchentoot serves in the guest and the
+# runner GETs it; dexador GETs that server from inside the guest.
+stage_sockets() {
+  local red=0 server guest_pid waited=0
+  mkdir -p "$work/http-sockets" "$c/temp" "$c/cache-sockets"
+  printf 'sogen-runner-ok\n' > "$work/http-sockets/index.html"
+  rm -f "$c/temp/sockets-serving" "$c/temp/sockets-curled"
+  (cd "$work/http-sockets" && exec python3 -m http.server 18082 --bind 127.0.0.1) > "$out/sockets-server.log" 2>&1 &
+  server=$!
+  cat > "$c/sockets.lisp" <<'LISP'
+;; warm.lisp's attach, a step at a time, over dexador's socket backend: each
+;; step bounded, and a watchdog naming the step every 30 seconds, so a hang
+;; says where it is. Lines go to the process's own stdout: quickload's
+;; :silent would swallow *standard-output*.
+(defvar *step* "loading")
+(defun note (control &rest args)
+  (format sb-sys:*stdout* "~&sockets: ~?~%" control args)
+  (finish-output sb-sys:*stdout*))
+(sb-thread:make-thread (lambda () (loop (sleep 30) (note "still in ~a" *step*))) :name "sockets watchdog")
+
+(defmacro bounded ((name seconds) &body body)
+  `(progn
+     (setf *step* ,name)
+     (handler-case (sb-sys:with-deadline (:seconds ,seconds) (progn ,@body))
+       (sb-sys:deadline-timeout () (note "~a: no answer in ~a s" ,name ,seconds) nil)
+       (error (condition)
+         (note "~a: ~a: ~a" ,name (type-of condition) (ignore-errors (princ-to-string condition)))
+         nil))))
+
+(defun body-text (body)
+  (string-trim '(#\Newline #\Return #\Space)
+               (if (stringp body) body (map 'string #'code-char body))))
+
+(load "C:/work/home/quicklisp/setup.lisp")
+(uiop:symbol-call :ql :quickload '(:dexador :hunchentoot) :silent t)
+(unless (find-package "DEXADOR.BACKEND.USOCKET")
+  (load (asdf:system-relative-pathname "dexador" "src/backend/usocket.lisp")))
+(setf (symbol-value (find-symbol "*DEXADOR-BACKEND*" "DEXADOR")) :usocket)
+(note "loaded, backend ~s" (symbol-value (find-symbol "*DEXADOR-BACKEND*" "DEXADOR")))
+
+;; The client alone: a GET to the runner's server.
+(let ((body (bounded ("runner get" 60)
+              (uiop:symbol-call :dex :get "http://127.0.0.1:18082/" :connect-timeout 10 :read-timeout 10 :keep-alive nil))))
+  (when body (note "runner body ~a" (body-text body))))
+
+;; The server alone: hunchentoot in the guest, the runner GETs it.
+(defvar *acceptor*
+  (bounded ("listen" 60)
+    (let ((acceptor (make-instance (find-symbol "EASY-ACCEPTOR" "HUNCHENTOOT") :address "127.0.0.1" :port 18083)))
+      (push (uiop:symbol-call :hunchentoot :create-prefix-dispatcher "/" (lambda () "sogen-guest-ok"))
+            (symbol-value (find-symbol "*DISPATCH-TABLE*" "HUNCHENTOOT")))
+      (uiop:symbol-call :hunchentoot :start acceptor))))
+(when *acceptor*
+  (note "serving on 18083")
+  (with-open-file (marker "C:/work/temp/sockets-serving" :direction :output :if-exists :supersede)
+    (write-line "serving" marker))
+  (bounded ("runner's get" 120)
+    (loop until (probe-file "C:/work/temp/sockets-curled") do (sleep 1)))
+  (note "runner's get done")
+
+  ;; Both at once, in one process: warm.lisp's own round trip.
+  (let ((body (bounded ("own get" 60)
+                (uiop:symbol-call :dex :get "http://127.0.0.1:18083/" :connect-timeout 10 :read-timeout 10 :keep-alive nil))))
+    (when body (note "own body ~a" (body-text body))))
+  (bounded ("stop" 60) (uiop:symbol-call :hunchentoot :stop *acceptor*)))
+(note "done")
+LISP
+  guest sockets 1800 XDG_CACHE_HOME='C:\work\cache-sockets' -- 'C:\sbcl\sbcl.exe' "${isolate_options[@]}" \
+    --load 'C:\work\sockets.lisp' > "$out/sockets-guest.log" 2>&1 &
+  guest_pid=$!
+  while [ "$waited" -lt 1500 ] && [ ! -e "$c/temp/sockets-serving" ] && kill -0 "$guest_pid" 2>/dev/null; do
+    sleep 2
+    waited=$((waited + 2))
+  done
+  if [ -e "$c/temp/sockets-serving" ]; then
+    echo "ci-sogen: sockets: the guest serves after ${waited}s; the runner's GET:" \
+      "$(curl -s -m 30 http://127.0.0.1:18083/ || echo "no answer (curl $?)")"
+    touch "$c/temp/sockets-curled"
+  fi
+  wait "$guest_pid" || true
+  kill "$server" 2>/dev/null || true
+  cat "$out/sockets-guest.log"
+  grep -h '^sockets: ' "$out/sockets.out" || true
+  grep -q '^sockets: runner body sogen-runner-ok' "$out/sockets.out" || red=1
+  grep -q '^sockets: own body sogen-guest-ok' "$out/sockets.out" || red=1
+  [ "$red" = 0 ]
+}
+
 # SOGEN_BUILD_SECONDS bounds the build (default 90 minutes). SOGEN_TRACE_BUILD=1
 # runs it under Sogen's whole log and keeps the log's tail: where a build that
 # hangs stops is what it is waiting on.
@@ -716,6 +807,7 @@ if stage start; then
   stage dump || true
   stage isolate || true
   stage winhttp || true
+  stage sockets || true
   if [ "${SOGEN_SKIP_BUILD:-}" = 1 ]; then
     skip build seams serve
   elif stage build; then
@@ -726,7 +818,7 @@ if stage start; then
   fi
 else
   red=1
-  skip dump isolate winhttp build seams serve
+  skip dump isolate winhttp sockets build seams serve
 fi
 
 {

@@ -163,9 +163,11 @@ jobs:
 
       - name: Run the release's guest half under Sogen
         # Debug runs: Sogen prints its exception ring as each stage ends
-        # (patch 0099).
+        # (patch 0099), and the build waits while the sockets probe asks why
+        # warm.lisp's attach hangs.
         env:
           SOGEN_TRACE_EXCEPTIONS: '1'
+          SOGEN_SKIP_BUILD: '1'
           SOGEN_DOWNLOADS: ${{ github.workspace }}/sogen-downloads
         run: |
           unzip -q sogen-root.zip -d sogen-root
