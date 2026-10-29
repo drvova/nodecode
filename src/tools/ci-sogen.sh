@@ -409,6 +409,121 @@ EOF
 EOF
   isolate mem '(load "C:/work/mem.lisp")' || red=1
   grep -q '^mem: 0 bad words' "$out/mem.out" || red=1
+  # winhttp: the build's last step, warm.lisp, attaches to its own gateway
+  # over HTTP, which on Windows is dexador's WinHTTP backend. Each call it
+  # makes, with GetLastError after it, against a server on the runner; and
+  # FormatMessage, which the winhttp library describes a failure with.
+  mkdir -p "$work/http"
+  printf 'sogen-winhttp-ok\n' > "$work/http/index.html"
+  (cd "$work/http" && exec python3 -m http.server 18080 --bind 127.0.0.1) > "$out/http-server.log" 2>&1 &
+  local server=$!
+  cat > "$c/winhttp.lisp" <<'EOF'
+;; Each WinHTTP call dexador's Windows backend makes for warm.lisp's attach,
+;; against a server on the runner, with the guest's GetLastError after it;
+;; and FormatMessage, which the winhttp library reports a failure through.
+(sb-alien:load-shared-object "winhttp.dll")
+(defvar *null* (sb-sys:int-sap 0))
+(defun probe-wide (string)
+  (let ((a (sb-alien:make-alien (sb-alien:unsigned 16) (1+ (length string)))))
+    (dotimes (i (length string)) (setf (sb-alien:deref a i) (char-code (char string i))))
+    (setf (sb-alien:deref a (length string)) 0)
+    (sb-alien:alien-sap a)))
+(defun probe-last-error ()
+  (sb-alien:alien-funcall (sb-alien:extern-alien "GetLastError" (function (sb-alien:unsigned 32)))))
+(defun probe-report (what value)
+  (format t "~&winhttp: ~a -> ~a, last error ~d~%" what value (probe-last-error))
+  (finish-output)
+  value)
+(defun probe-live-p (sap) (not (zerop (sb-sys:sap-int sap))))
+(let ((buffer (sb-alien:make-alien (sb-alien:unsigned 8) 512)))
+  (probe-report "FormatMessageA(2)"
+          (sb-alien:alien-funcall
+           (sb-alien:extern-alien "FormatMessageA"
+                                  (function (sb-alien:unsigned 32) (sb-alien:unsigned 32) sb-alien:system-area-pointer
+                                            (sb-alien:unsigned 32) (sb-alien:unsigned 32) sb-alien:system-area-pointer
+                                            (sb-alien:unsigned 32) sb-alien:system-area-pointer))
+           #x1000 *null* 2 0 (sb-alien:alien-sap buffer) 512 *null*)))
+(block probe
+  (let ((session (probe-report "WinHttpOpen"
+                         (sb-alien:alien-funcall
+                          (sb-alien:extern-alien "WinHttpOpen"
+                                                 (function sb-alien:system-area-pointer sb-alien:system-area-pointer
+                                                           (sb-alien:unsigned 32) sb-alien:system-area-pointer
+                                                           sb-alien:system-area-pointer (sb-alien:unsigned 32)))
+                          (probe-wide "nodecode-probe") 1 *null* *null* 0))))
+    (unless (probe-live-p session) (return-from probe))
+    (probe-report "WinHttpSetTimeouts"
+            (sb-alien:alien-funcall
+             (sb-alien:extern-alien "WinHttpSetTimeouts"
+                                    (function sb-alien:int sb-alien:system-area-pointer sb-alien:int sb-alien:int
+                                              sb-alien:int sb-alien:int))
+             session 5000 5000 5000 5000))
+    (let ((connection (probe-report "WinHttpConnect"
+                              (sb-alien:alien-funcall
+                               (sb-alien:extern-alien "WinHttpConnect"
+                                                      (function sb-alien:system-area-pointer sb-alien:system-area-pointer
+                                                                sb-alien:system-area-pointer (sb-alien:unsigned 16)
+                                                                (sb-alien:unsigned 32)))
+                               session (probe-wide "127.0.0.1") 18080 0))))
+      (unless (probe-live-p connection) (return-from probe))
+      (let ((request (probe-report "WinHttpOpenRequest"
+                             (sb-alien:alien-funcall
+                              (sb-alien:extern-alien "WinHttpOpenRequest"
+                                                     (function sb-alien:system-area-pointer sb-alien:system-area-pointer
+                                                               sb-alien:system-area-pointer sb-alien:system-area-pointer
+                                                               sb-alien:system-area-pointer sb-alien:system-area-pointer
+                                                               sb-alien:system-area-pointer (sb-alien:unsigned 32)))
+                              connection (probe-wide "GET") (probe-wide "/") *null* *null* *null* 0))))
+        (unless (probe-live-p request) (return-from probe))
+        (sb-alien:with-alien ((features (sb-alien:unsigned 32) #xb))
+          (probe-report "WinHttpSetOption(disable cookies, redirects)"
+                  (sb-alien:alien-funcall
+                   (sb-alien:extern-alien "WinHttpSetOption"
+                                          (function sb-alien:int sb-alien:system-area-pointer (sb-alien:unsigned 32)
+                                                    sb-alien:system-area-pointer (sb-alien:unsigned 32)))
+                   request 63 (sb-alien:alien-sap (sb-alien:addr features)) 4)))
+        (when (zerop (probe-report "WinHttpSendRequest"
+                             (sb-alien:alien-funcall
+                              (sb-alien:extern-alien "WinHttpSendRequest"
+                                                     (function sb-alien:int sb-alien:system-area-pointer
+                                                               sb-alien:system-area-pointer (sb-alien:unsigned 32)
+                                                               sb-alien:system-area-pointer (sb-alien:unsigned 32)
+                                                               (sb-alien:unsigned 32) sb-alien:system-area-pointer))
+                              request *null* 0 *null* 0 0 *null*)))
+          (return-from probe))
+        (when (zerop (probe-report "WinHttpReceiveResponse"
+                             (sb-alien:alien-funcall
+                              (sb-alien:extern-alien "WinHttpReceiveResponse"
+                                                     (function sb-alien:int sb-alien:system-area-pointer
+                                                               sb-alien:system-area-pointer))
+                              request *null*)))
+          (return-from probe))
+        (sb-alien:with-alien ((status (sb-alien:unsigned 32) 0) (size (sb-alien:unsigned 32) 4))
+          (probe-report "WinHttpQueryHeaders(status)"
+                  (sb-alien:alien-funcall
+                   (sb-alien:extern-alien "WinHttpQueryHeaders"
+                                          (function sb-alien:int sb-alien:system-area-pointer (sb-alien:unsigned 32)
+                                                    sb-alien:system-area-pointer sb-alien:system-area-pointer
+                                                    sb-alien:system-area-pointer sb-alien:system-area-pointer))
+                   request #x20000013 *null* (sb-alien:alien-sap (sb-alien:addr status))
+                   (sb-alien:alien-sap (sb-alien:addr size)) *null*))
+          (format t "~&winhttp: status ~d~%" status))
+        (let ((buffer (sb-alien:make-alien (sb-alien:unsigned 8) 256)))
+          (sb-alien:with-alien ((got (sb-alien:unsigned 32) 0))
+            (probe-report "WinHttpReadData"
+                    (sb-alien:alien-funcall
+                     (sb-alien:extern-alien "WinHttpReadData"
+                                            (function sb-alien:int sb-alien:system-area-pointer sb-alien:system-area-pointer
+                                                      (sb-alien:unsigned 32) sb-alien:system-area-pointer))
+                     request (sb-alien:alien-sap buffer) 255 (sb-alien:alien-sap (sb-alien:addr got))))
+            (format t "~&winhttp: body ~a~%"
+                    (string-trim '(#\Newline #\Return)
+                                 (map 'string #'code-char (loop for i below got collect (sb-alien:deref buffer i)))))))))))
+EOF
+  isolate winhttp '(load "C:/work/winhttp.lisp")' || red=1
+  kill "$server" 2>/dev/null || true
+  grep -h '^winhttp: ' "$out/winhttp.out" || true
+  grep -q '^winhttp: body sogen-winhttp-ok' "$out/winhttp.out" || red=1
   [ "$red" = 0 ]
 }
 
@@ -533,10 +648,14 @@ skip() {
   for name in "$@"; do results+=("$name|skipped|-"); done
 }
 
+# SOGEN_SKIP_BUILD=1 stops after the isolated probes, for a run that asks
+# them alone.
 if stage start; then
   stage dump || true
   stage isolate || true
-  if stage build; then
+  if [ "${SOGEN_SKIP_BUILD:-}" = 1 ]; then
+    skip build seams serve
+  elif stage build; then
     stage seams || true
     stage serve || true
   else
