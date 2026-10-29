@@ -207,8 +207,10 @@ guest() {
     mv "$out/$name.jsonl.cut" "$out/$name.jsonl"
   fi
   [ "$rc" = 0 ] && return 0
+  # Sogen notes every read of address 0, and SBCL's lazy linkage makes one a
+  # call: the guest's own last lines are what tell why it stopped.
   echo "ci-sogen: $name failed (rc $rc$([ "$rc" = 124 ] && echo ', timed out')); the last of its output:"
-  tail -n 40 "$out/$name.out"
+  grep -v '^Null-pointer call to ' "$out/$name.out" | tail -n 40
   echo "ci-sogen: the last of Sogen's events for $name:"
   tail -n 8 "$out/$name.jsonl" 2>/dev/null | cut -c1-400
   return 1

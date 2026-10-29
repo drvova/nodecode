@@ -1,0 +1,154 @@
+Sogen: a guard page on the thread's own stack grows it as Windows does
+
+Windows grows a thread's stack with a guard region below the committed part
+(a page plus the thread's guarantee, which SetThreadStackGuarantee sets).
+Touching it does not reach the guest: the kernel clears the faulting page's
+guard, moves the guard region down below it and retries the access. When no
+room is left above the stack's last page it commits the rest instead, so a
+handler has the guaranteed bytes to run in, and raises STATUS_STACK_OVERFLOW.
+Only a guard page anywhere else is a STATUS_GUARD_PAGE_VIOLATION.
+
+Sogen commits every stack in full, but kernelbase's SetThreadStackGuarantee
+still lays its guard region, at the stack's bottom, and Sogen raised
+STATUS_GUARD_PAGE_VIOLATION for any guard page. SBCL asks for a 64 KB
+guarantee on every thread and turns STATUS_STACK_OVERFLOW into a Lisp
+STORAGE-CONDITION; a guard page violation it does not handle, so a thread
+that ran its stack down took the process with it, exit status 0x80000001.
+
+A guard-page fault inside the faulting thread's stack (TEB DeallocationStack
+to StackBase) is now the kernel's stack growth: the guard region moves down
+and TEB StackLimit follows it, or the stack is spent and the guest gets
+STATUS_STACK_OVERFLOW. Elsewhere the fault clears the guard of the faulting
+page alone, as Windows does (it used to clear a span measured from the
+faulting page but laid from the allocation's base), and is logged with the
+thread it hit, since a guest seldom survives one.
+
+diff --git a/src/emulator-platform/platform/status.hpp b/src/emulator-platform/platform/status.hpp
+index a6cb9ab..ed1a802 100644
+--- a/src/emulator-platform/platform/status.hpp
++++ b/src/emulator-platform/platform/status.hpp
+@@ -31,6 +31,7 @@ namespace sogen
+ #define STATUS_FLOAT_OVERFLOW          ((NTSTATUS)0xC0000091L)
+ #define STATUS_FLOAT_STACK_CHECK       ((NTSTATUS)0xC0000092L)
+ #define STATUS_FLOAT_UNDERFLOW         ((NTSTATUS)0xC0000093L)
++#define STATUS_STACK_OVERFLOW          ((NTSTATUS)0xC00000FDL)
+ #define STATUS_ASSERTION_FAILURE      ((NTSTATUS)0xC0000420L)
+ #endif
+ 
+diff --git a/src/windows-emulator/exception_dispatch.cpp b/src/windows-emulator/exception_dispatch.cpp
+index dca8399..a0619d6 100644
+--- a/src/windows-emulator/exception_dispatch.cpp
++++ b/src/windows-emulator/exception_dispatch.cpp
+@@ -372,6 +372,15 @@ namespace sogen
+                            });
+     }
+ 
++    void dispatch_stack_overflow(windows_emulator& win_emu, vcpu_context& vcpu, const uint64_t address, const memory_operation operation)
++    {
++        dispatch_exception(win_emu, vcpu, STATUS_STACK_OVERFLOW,
++                           {
++                               map_violation_operation_to_parameter(operation),
++                               address,
++                           });
++    }
++
+     void dispatch_illegal_instruction_violation(windows_emulator& win_emu, vcpu_context& vcpu)
+     {
+         dispatch_exception(win_emu, vcpu, STATUS_ILLEGAL_INSTRUCTION, {});
+diff --git a/src/windows-emulator/exception_dispatch.hpp b/src/windows-emulator/exception_dispatch.hpp
+index 6c33a83..fff0023 100644
+--- a/src/windows-emulator/exception_dispatch.hpp
++++ b/src/windows-emulator/exception_dispatch.hpp
+@@ -35,6 +35,7 @@ namespace sogen
+     bool dispatch_debug_exception(windows_emulator& win_emu, CONTEXT64& ctx, EMU_EXCEPTION_RECORD<EmulatorTraits<Emu64>>& record);
+     void dispatch_access_violation(windows_emulator& win_emu, vcpu_context& vcpu, uint64_t address, memory_operation operation);
+     void dispatch_guard_page_violation(windows_emulator& win_emu, vcpu_context& vcpu, uint64_t address, memory_operation operation);
++    void dispatch_stack_overflow(windows_emulator& win_emu, vcpu_context& vcpu, uint64_t address, memory_operation operation);
+     void dispatch_illegal_instruction_violation(windows_emulator& win_emu, vcpu_context& vcpu);
+     void dispatch_integer_division_by_zero(windows_emulator& win_emu, vcpu_context& vcpu);
+     void dispatch_x87_floating_point_error(windows_emulator& win_emu, vcpu_context& vcpu);
+diff --git a/src/windows-emulator/windows_emulator.cpp b/src/windows-emulator/windows_emulator.cpp
+index 7aed3a0..9ff7728 100644
+--- a/src/windows-emulator/windows_emulator.cpp
++++ b/src/windows-emulator/windows_emulator.cpp
+@@ -777,6 +777,55 @@ namespace sogen
+             fake_env.number_of_processors = std::max(fake_env.number_of_processors, vcpu_count);
+             return fake_env;
+         }
++
++        enum class stack_guard_outcome
++        {
++            not_on_stack,
++            grown,
++            exhausted,
++        };
++
++        // A guard page on the faulting thread's own stack is how Windows grows that stack and finds it
++        // exhausted (MiCheckForUserStackOverflow): the kernel clears the faulting page's guard, moves the
++        // guard region (a page plus the thread's guarantee, see SetThreadStackGuarantee) down below it and
++        // retries the access, raising nothing. When no room is left above the stack's last page, it commits
++        // the rest of the stack instead, so the handler has the guaranteed bytes to run in, and raises
++        // STATUS_STACK_OVERFLOW. Only a guard page anywhere else reaches the guest as
++        // STATUS_GUARD_PAGE_VIOLATION.
++        stack_guard_outcome handle_stack_guard_page(memory_manager& memory, emulator_thread& thread, const uint64_t address,
++                                                    const nt_memory_permission permissions)
++        {
++            if (!thread.teb64)
++            {
++                return stack_guard_outcome::not_on_stack;
++            }
++
++            const auto teb = thread.teb64->read();
++            const auto stack_bottom = teb.DeallocationStack;
++            const auto stack_top = teb.NtTib.StackBase;
++            if (address < stack_bottom || address >= stack_top)
++            {
++                return stack_guard_outcome::not_on_stack;
++            }
++
++            constexpr uint64_t page_size = 0x1000;
++            const auto usable = permissions & ~memory_permission_ext::guard;
++            const auto page = page_align_down(address);
++            const auto guard_size = page_size + page_align_up(teb.GuaranteedStackBytes);
++
++            if (page < stack_bottom + guard_size + page_size * 2)
++            {
++                const auto limit = stack_bottom + page_size;
++                memory.protect_memory(limit, static_cast<size_t>(page + page_size - limit), usable);
++                thread.teb64->access([&](TEB64& t) { t.NtTib.StackLimit = limit; });
++                return stack_guard_outcome::exhausted;
++            }
++
++            memory.protect_memory(page, page_size, usable);
++            memory.protect_memory(page - guard_size, static_cast<size_t>(guard_size), permissions);
++            thread.teb64->access([&](TEB64& t) { t.NtTib.StackLimit = page; });
++            return stack_guard_outcome::grown;
++        }
+     }
+ 
+     PEMachineType get_application_machine(const emulator_settings& settings, application_settings app_settings)
+@@ -1340,9 +1389,21 @@ namespace sogen
+             auto region = this->memory.get_region_info(address);
+             if (region.permissions.is_guarded())
+             {
+-                // Unset the GUARD_PAGE flag and dispatch a STATUS_GUARD_PAGE_VIOLATION
+-                this->memory.protect_memory(region.allocation_base, region.length, region.permissions & ~memory_permission_ext::guard);
+-                dispatch_guard_page_violation(*this, vcpu, address, operation);
++                switch (handle_stack_guard_page(this->memory, vcpu.thread(), address, region.permissions))
++                {
++                case stack_guard_outcome::grown:
++                    return memory_violation_continuation::restart;
++                case stack_guard_outcome::exhausted:
++                    dispatch_stack_overflow(*this, vcpu, address, operation);
++                    break;
++                case stack_guard_outcome::not_on_stack:
++                    this->log.error("Guard page violation at 0x%llx on thread %u, outside its stack\n",
++                                    static_cast<unsigned long long>(address), static_cast<unsigned>(vcpu.thread().id));
++                    // Unset the faulting page's GUARD_PAGE flag and dispatch a STATUS_GUARD_PAGE_VIOLATION
++                    this->memory.protect_memory(region.start, 0x1000, region.permissions & ~memory_permission_ext::guard);
++                    dispatch_guard_page_violation(*this, vcpu, address, operation);
++                    break;
++                }
+             }
+             else
+             {
