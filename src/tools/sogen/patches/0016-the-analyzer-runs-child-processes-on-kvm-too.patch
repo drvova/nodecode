@@ -1,0 +1,31 @@
+Sogen: the analyzer runs child processes on KVM too
+
+The analyzer gave a guest a process manager only on the WHP backend;
+on any other, NtCreateUserProcess answered STATUS_NOT_SUPPORTED. The
+manager runs each child in a sandbox process of its own, and the
+sandbox builds with WHP on Windows and KVM on Linux: the sandbox tool
+itself runs child processes on KVM through the same manager.
+
+nodecode's platform seams run a shell and a detached cmd as children;
+under the KVM backend neither could start.
+
+The analyzer now makes the manager on KVM as well; the sandbox
+executable has to sit beside it, as it does for WHP.
+
+diff --git a/src/windows-analyzer/main.cpp b/src/windows-analyzer/main.cpp
+index e0ab059..9135ec4 100644
+--- a/src/windows-analyzer/main.cpp
++++ b/src/windows-analyzer/main.cpp
+@@ -715,8 +715,11 @@ namespace sogen
+             std::unique_ptr<process_manager> manager{};
+ 
+ #ifndef OS_EMSCRIPTEN
++            // A child process runs in a sandbox of its own, whose backend is WHP on Windows and KVM on Linux:
++            // the backends the sandbox builds with.
+             const auto is_x86_64_target = get_target_machine(options, args) != PEMachineType::ARM64;
+-            if (is_x86_64_target && options.backend.value_or(get_x86_64_emulator_backend_from_environment()) == backend_type::whp)
++            const auto backend = options.backend.value_or(get_x86_64_emulator_backend_from_environment());
++            if (is_x86_64_target && (backend == backend_type::whp || backend == backend_type::kvm))
+             {
+                 manager = std::make_unique<subprocess_process_manager>(get_sandbox_executable(), [&](const auto port, const auto& token) {
+                     return create_managed_process_arguments(options, port, token);

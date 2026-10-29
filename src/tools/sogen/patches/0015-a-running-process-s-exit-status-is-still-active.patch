@@ -1,0 +1,23 @@
+Sogen: a running process's exit status is STILL_ACTIVE
+
+ProcessBasicInformation on the process asking left its ExitStatus 0,
+which GetExitCodeProcess hands back as the exit code: the process read
+itself as one that had exited with 0. A running process's is
+STATUS_PENDING, STILL_ACTIVE to GetExitCodeProcess, as Sogen already
+answers for its child processes and the synthetic ones it vouches for.
+
+nodecode's pid-live-p opens a process for query and asks its exit code;
+asked about its own pid, under Sogen it answered no.
+
+diff --git a/src/windows-emulator/syscalls/process.cpp b/src/windows-emulator/syscalls/process.cpp
+index 6b1c67e..b9e6bcd 100644
+--- a/src/windows-emulator/syscalls/process.cpp
++++ b/src/windows-emulator/syscalls/process.cpp
+@@ -680,6 +680,7 @@ namespace sogen
+                         c.proc.kusd.access([](const KUSER_SHARED_DATA64& kusd) { return kusd.ActiveProcessorCount; });
+                     basic_info.AffinityMask = processor_count >= 64 ? ~0ull : ((1ull << processor_count) - 1);
+                     basic_info.UniqueProcessId = c.proc.process_id;
++                    basic_info.ExitStatus = STATUS_PENDING; // STILL_ACTIVE: the process asking is running
+                 };
+ 
+                 switch (process_information_length)

@@ -51,7 +51,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: sogen-bin
-          key: sogen-bin-${{ env.SOGEN_REV }}-${{ hashFiles('src/tools/sogen/patches/*.patch') }}-kvm-v1
+          key: sogen-bin-${{ env.SOGEN_REV }}-${{ hashFiles('src/tools/sogen/patches/*.patch') }}-kvm-v2
 
       - name: Check out Sogen
         if: steps.sogen.outputs.cache-hit != 'true'
@@ -91,8 +91,9 @@ jobs:
           key: sogen-ccache-${{ env.SOGEN_REV }}-${{ hashFiles('src/tools/sogen/patches/*.patch') }}
           restore-keys: sogen-ccache-${{ env.SOGEN_REV }}-
 
-      # The analyzer alone, without the parts a headless KVM run never uses:
-      # the Rust backend (icicle), the Steam bridge and the SDL3 UI.
+      # The analyzer and the sandbox it runs a guest's child processes in,
+      # without the parts a headless KVM run never uses: the Rust backend
+      # (icicle), the Steam bridge and the SDL3 UI.
       - name: Build Sogen's analyzer
         if: steps.sogen.outputs.cache-hit != 'true'
         working-directory: sogen
@@ -106,7 +107,7 @@ jobs:
         run: |
           cmake --preset=release -DSOGEN_ENABLE_RUST_CODE=OFF -DSOGEN_ENABLE_STEAM=OFF -DSOGEN_ENABLE_SDL3=OFF \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
-          cmake --build --preset=release --target analyzer
+          cmake --build --preset=release --target analyzer sandbox
           ccache --show-stats
           mkdir -p ../sogen-bin
           cp -a build/release/artifacts/. ../sogen-bin/

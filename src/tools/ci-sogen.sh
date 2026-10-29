@@ -775,7 +775,10 @@ stage_seams() {
   trial '(multiple-value-bind (out err status) (nlk:run-bounded (nlk:shell-argv "echo hi; echo bad 1>&2; exit 4") :seconds 20) (if (and (search "hi" out) (search "bad" err) (eql status 4)) 1 0))' 1 || red=1
   trial '(if (eq :timeout (nth-value 2 (nlk:run-bounded (nlk:shell-argv "sleep 30") :seconds 1))) 1 0)' 1 || red=1
   trial '(if (nlk:pid-live-p (sb-posix:getpid)) 1 0)' 1 || red=1
-  trial '(let ((before (nlk:resident-bytes))) (if (and (integerp before) (eq t (nlk::release-image-pages)) (< (nlk:resident-bytes) before)) 1 0))' 1 || red=1
+  # release-windows.ps1's working-set trim measures what the kernel took
+  # back. Sogen keeps no working set: it takes SetProcessWorkingSetSize and
+  # trims nothing, so the check has nothing here to measure.
+  echo "ci-sogen: skip  the working-set trim -- an emulated process has no working set"
   trial '(if (nlk:pid-live-p 4000000) 0 1)' 1 || red=1
   trial '(let ((lock (nlk:lock-file "C:/work/temp/probe.lock"))) (if (and lock (nlk:file-locked-p "C:/work/temp/probe.lock") (progn (nlk:unlock-file lock) (not (nlk:file-locked-p "C:/work/temp/probe.lock")))) 1 0))' 1 || red=1
   trial '(progn (nlk:spawn-detached (list "cmd" "/c" "echo detached-marker") "C:/work/temp/detached.log") (sleep 3) (if (search "detached-marker" (uiop:read-file-string "C:/work/temp/detached.log")) 1 0))' 1 || red=1
