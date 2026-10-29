@@ -445,10 +445,17 @@ EOF
 EOF
   isolate mem '(load "C:/work/mem.lisp")' || red=1
   grep -q '^mem: 0 bad words' "$out/mem.out" || red=1
-  # winhttp: the build's last step, warm.lisp, attaches to its own gateway
-  # over HTTP, which on Windows is dexador's WinHTTP backend. Each call it
-  # makes, with GetLastError after it, against a server on the runner; and
-  # FormatMessage, which the winhttp library describes a failure with.
+  [ "$red" = 0 ]
+}
+
+# winhttp: nodecode on Windows talks HTTP through dexador's WinHTTP backend,
+# warm.lisp's attach to its own gateway included. Each call that backend
+# makes, with GetLastError after it, against a server on the runner; and
+# FormatMessage, which the winhttp library describes a failure with. Under
+# Sogen the send fails at WinHTTP's network change notifications, which need
+# the NSI service; the build uses dexador's socket backend instead.
+stage_winhttp() {
+  local red=0
   mkdir -p "$work/http"
   printf 'sogen-winhttp-ok\n' > "$work/http/index.html"
   (cd "$work/http" && exec python3 -m http.server 18080 --bind 127.0.0.1) > "$out/http-server.log" 2>&1 &
@@ -566,12 +573,30 @@ EOF
 # SOGEN_BUILD_SECONDS bounds the build (default 90 minutes). SOGEN_TRACE_BUILD=1
 # runs it under Sogen's whole log and keeps the log's tail: where a build that
 # hangs stops is what it is waiting on.
+#
+# WinHTTP cannot send under Sogen -- the winhttp stage says how far it gets --
+# so this build's dexador talks HTTP through its socket backend, the one it
+# uses everywhere but Windows: right after quickload loads dexador, before
+# nodecode/bin's warm.lisp attaches to its own gateway, the backend is loaded
+# and made dexador's. The image this build dumps differs from the release's
+# in that alone.
 stage_build() {
   local rc=0
+  cat > "$c/socket-backend.lisp" <<'LISP'
+(require :asdf)
+(defmethod asdf:perform :after ((operation asdf:load-op) (system asdf:system))
+  (when (and (string= (asdf:component-name system) "dexador")
+             (not (find-package "DEXADOR.BACKEND.USOCKET")))
+    (load (asdf:system-relative-pathname "dexador" "src/backend/usocket.lisp"))
+    (setf (symbol-value (find-symbol "*DEXADOR-BACKEND*" "DEXADOR")) :usocket)
+    (format t "~&sogen: dexador's socket backend in place of WinHTTP~%")))
+LISP
   GUEST_TRACE="${SOGEN_TRACE_BUILD:-}" GUEST_CWD='C:\work\nodecode\src' guest build "${SOGEN_BUILD_SECONDS:-5400}" \
     NODECODE_BUILD_COMMIT="$label" -- 'C:\sbcl\sbcl.exe' \
     --dynamic-space-size 8192 --control-stack-size 8MB --noinform --non-interactive \
-    --load 'C:\work\nodecode\src\tools\windows-release.lisp' || rc=1
+    --load 'C:\work\socket-backend.lisp' --load 'C:\work\nodecode\src\tools\windows-release.lisp' || rc=1
+  grep -q "^sogen: dexador's socket backend in place of WinHTTP" "$out/build.out" ||
+    echo "ci-sogen: the build never put dexador's socket backend in place of WinHTTP"
   if [ "${SOGEN_TRACE_BUILD:-}" = 1 ]; then
     echo "ci-sogen: the build's threads, under Sogen's whole log:"
     grep -i -E 'thread (created|terminated|exit)|switch' "$out/build.out" | tail -n 30
@@ -689,6 +714,7 @@ skip() {
 if stage start; then
   stage dump || true
   stage isolate || true
+  stage winhttp || true
   if [ "${SOGEN_SKIP_BUILD:-}" = 1 ]; then
     skip build seams serve
   elif stage build; then
@@ -699,7 +725,7 @@ if stage start; then
   fi
 else
   red=1
-  skip dump isolate build seams serve
+  skip dump isolate winhttp build seams serve
 fi
 
 {
