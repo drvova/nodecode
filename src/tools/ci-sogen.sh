@@ -83,17 +83,26 @@ cp "$work/dl/sqlite3.dll" "$tree/src/libsqlite3.dll"
 cp "$work/git/mingw64/bin/libssl-3-x64.dll" "$work/git/mingw64/bin/libcrypto-3-x64.dll" "$tree/src/"
 
 # --- what the emulation root lacks ---------------------------------------------
-# WinHTTP, dexador's Windows backend, sends through webio.dll, which Sogen's
-# root does not carry: without it WinHttpSendRequest fails with
-# ERROR_PROC_NOT_FOUND, its delay load of webio failing before any socket
-# opens. Microsoft's symbol server keeps every build; this is 24H2's (the
-# root is 10.0.26100), pinned by its hash.
-webio="$root/filesys/c/windows/system32/webio.dll"
-if [ ! -e "$webio" ]; then
-  fetch "$webio" https://msdl.microsoft.com/download/symbols/webio.dll/62540C89D6000/webio.dll
-  echo "e95fe232703c98df2a40dba5aab4bac16e0a36f50928b4767b44fe820bcbef5b  $webio" | sha256sum -c --quiet - ||
-    { rm -f "$webio"; echo 'ci-sogen: webio.dll is not the build pinned' >&2; exit 1; }
-fi
+# DLLs of the network stack Sogen's root does not carry, from Microsoft's
+# symbol server, which keeps every build: 24H2's newest (the root is
+# 10.0.26100), each pinned by its hash.
+#   webio.dll   WinHTTP's transport, delay-loaded by ordinal; without it
+#               WinHttpSendRequest fails with ERROR_PROC_NOT_FOUND before any
+#               socket opens (dexador's Windows backend is WinHTTP).
+#   winnsi.dll  iphlpapi's network store client, delay-loaded for its change
+#   nrtapi.dll  notifications, and the name resolution trigger webio and
+#               winhttp import: with webio in, the send still failed on a
+#               DLL the root lacks, right after iphlpapi.dll loaded.
+root_dll() { # root_dll NAME SYMBOL-SERVER-KEY SHA256
+  local dll="$root/filesys/c/windows/system32/$1"
+  [ -e "$dll" ] && return 0
+  fetch "$dll" "https://msdl.microsoft.com/download/symbols/$1/$2/$1"
+  echo "$3  $dll" | sha256sum -c --quiet - ||
+    { rm -f "$dll"; echo "ci-sogen: $1 is not the build pinned" >&2; exit 1; }
+}
+root_dll webio.dll 62540C89D6000 e95fe232703c98df2a40dba5aab4bac16e0a36f50928b4767b44fe820bcbef5b
+root_dll winnsi.dll FA818D5AE000 943d433048e58f5660ea654f7a5c342058a9579b9c9a9b596633a93ebbad00e5
+root_dll nrtapi.dll DB41FFB27000 2e59077be1cca6452a9575691ec1d3b8d7552e9a629c0e83371562c97e10965e
 
 # Quicklisp under the guest's home, on windows-release.lisp's own dist, with
 # every release the nodecode/bin dump reaches downloaded by the host's SBCL

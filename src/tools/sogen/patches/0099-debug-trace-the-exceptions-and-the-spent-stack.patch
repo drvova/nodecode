@@ -7,13 +7,14 @@ that runs off its stack's end does. A stack overflow also prints the code
 addresses that occur most on the stack between the stack pointer and the
 stack's top: module+offset for loaded images, the raw address for SBCL's
 spaces. And a system call that answers with an error status is logged
-with its first three arguments, the first 20 of each call and status.
+with its first three arguments, the first 20 of each call and status;
+a failed open also names what it looked up (the first 300 of those).
 
 diff --git a/src/windows-emulator/syscall_dispatcher.cpp b/src/windows-emulator/syscall_dispatcher.cpp
-index 56380af..6bdee25 100644
+index 56380af..77d6bf6 100644
 --- a/src/windows-emulator/syscall_dispatcher.cpp
 +++ b/src/windows-emulator/syscall_dispatcher.cpp
-@@ -115,8 +115,31 @@ namespace sogen
+@@ -115,8 +115,58 @@ namespace sogen
                  return;
              }
  
@@ -32,12 +33,39 @@ index 56380af..6bdee25 100644
 +                const auto status = static_cast<uint32_t>(debug_x64->reg(x86_register::rax));
 +                if ((status & 0xC0000000) == 0xC0000000)
 +                {
-+                    static std::map<std::pair<std::string, uint32_t>, uint32_t> seen{};
-+                    if (++seen[{entry->second.name, status}] <= 20)
++                    // The name a failed open looked up: OBJECT_ATTRIBUTES.ObjectName, a UNICODE_STRING.
++                    std::string object_name{};
++                    const std::string_view name_of{entry->second.name};
++                    const auto attributes = name_of == "NtQueryAttributesFile" || name_of == "NtQueryFullAttributesFile"
++                                                ? debug_args[0]
++                                                : (name_of == "NtOpenFile" || name_of == "NtCreateFile" || name_of == "NtOpenSection" ||
++                                                   name_of == "NtOpenKey" || name_of == "NtOpenKeyEx")
++                                                      ? debug_args[2]
++                                                      : 0;
++                    uint64_t unicode_string{};
++                    if (attributes && debug_x64->try_read_memory(attributes + 16, &unicode_string, sizeof(unicode_string)) && unicode_string)
 +                    {
-+                        win_emu.log.error("Syscall %s -> 0x%08X (r10 0x%llx rdx 0x%llx r8 0x%llx) thread %u\n", syscall_name, status,
++                        uint16_t length{};
++                        uint64_t buffer{};
++                        if (debug_x64->try_read_memory(unicode_string, &length, sizeof(length)) &&
++                            debug_x64->try_read_memory(unicode_string + 8, &buffer, sizeof(buffer)) && buffer && length < 1024)
++                        {
++                            std::u16string text(length / 2, u'\0');
++                            if (debug_x64->try_read_memory(buffer, text.data(), length))
++                            {
++                                object_name = " " + u16_to_u8(text);
++                            }
++                        }
++                    }
++
++                    static std::map<std::pair<std::string, uint32_t>, uint32_t> seen{};
++                    const auto count = ++seen[{entry->second.name, status}];
++                    if (count <= 20 || (!object_name.empty() && count <= 300))
++                    {
++                        win_emu.log.error("Syscall %s -> 0x%08X (r10 0x%llx rdx 0x%llx r8 0x%llx) thread %u%s\n", syscall_name, status,
 +                                          static_cast<unsigned long long>(debug_args[0]), static_cast<unsigned long long>(debug_args[1]),
-+                                          static_cast<unsigned long long>(debug_args[2]), static_cast<unsigned>(vcpu.thread().id));
++                                          static_cast<unsigned long long>(debug_args[2]), static_cast<unsigned>(vcpu.thread().id),
++                                          object_name.c_str());
 +                    }
 +                }
 +            }
