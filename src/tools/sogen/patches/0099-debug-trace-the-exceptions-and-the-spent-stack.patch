@@ -9,7 +9,70 @@ stack's top: module+offset for loaded images, the raw address for SBCL's
 spaces. And a system call that answers with an error status is logged
 with its first three arguments, the first 20 of each call and status;
 a failed open also names what it looked up (the first 300 of those).
+Each ALPC port a guest connects is named, a port nothing serves says so,
+and each RPC call is logged with its interface, opnum, transfer syntax,
+and the first bytes of its request and reply (the first 40 per
+interface).
 
+diff --git a/src/windows-emulator/port.cpp b/src/windows-emulator/port.cpp
+index 6feda1a..1362745 100644
+--- a/src/windows-emulator/port.cpp
++++ b/src/windows-emulator/port.cpp
+@@ -34,8 +34,8 @@ namespace sogen
+ 
+             lpc_request_result handle_request(windows_emulator& win_emu, const lpc_request_context&) override
+             {
+-                (void)win_emu;
+-                // win_emu.log.error("!!! BAD PORT: %s\n", u16_to_u8(name_).c_str());
++                // Debug (nodecode spike, not for upstream): a port nothing in Sogen serves.
++                win_emu.log.error("!!! BAD PORT: %s\n", u16_to_u8(name_).c_str());
+                 return STATUS_NOT_SUPPORTED;
+             }
+ 
+@@ -298,6 +298,9 @@ namespace sogen
+ 
+     std::unique_ptr<port> create_port(const std::u16string_view port)
+     {
++        // Debug (nodecode spike, not for upstream): each port a guest connects.
++        std::fprintf(stderr, "ALPC connect: %s\n", u16_to_u8(std::u16string(port)).c_str());
++
+         if (port == u"\\Windows\\ApiPort")
+         {
+             return create_api_port();
+@@ -720,6 +723,33 @@ namespace sogen
+         std::vector<alpc_reply_handle> reply_handles;
+         const auto status = this->handle_rpc(win_emu, *procedure_id, rpc_context, writer, reply_handles);
+ 
++        {
++            // Debug (nodecode spike, not for upstream): each RPC call, its request and reply, the first 40 per
++            // interface.
++            static std::map<std::array<uint8_t, 16>, uint32_t> calls{};
++            if (++calls[this->bound_interface_] <= 40)
++            {
++                const auto hex = [](const uint8_t* data, const size_t size) {
++                    std::string text{};
++                    for (size_t i = 0; i < size; ++i)
++                    {
++                        char byte[4];
++                        std::snprintf(byte, sizeof(byte), "%02x", data[i]);
++                        text += byte;
++                    }
++                    return text;
++                };
++                std::vector<uint8_t> request(std::min<size_t>(rpc_context.send_buffer_length, 192));
++                (void)win_emu.memory.try_read_memory(rpc_context.send_buffer, request.data(), request.size());
++                const auto reply_size = std::min<size_t>(payload.size() - rpc_call_immediate_response_header_size, 128);
++                win_emu.log.error("RPC %s opnum %u ndr64 %d flags 0x%x request %u bytes -> 0x%08X\n  in  %s\n  out %s\n",
++                                  hex(this->bound_interface_.data(), 16).c_str(), *procedure_id, binding->second.ndr64 ? 1 : 0,
++                                  *call_flags, static_cast<unsigned>(rpc_context.send_buffer_length), static_cast<uint32_t>(status),
++                                  hex(request.data(), request.size()).c_str(),
++                                  hex(payload.data() + rpc_call_immediate_response_header_size, reply_size).c_str());
++            }
++        }
++
+         std::vector<uint8_t> view_payload;
+         const auto ndr_size = payload.size() - rpc_call_immediate_response_header_size;
+         if (ndr_size > rpc_call_max_immediate_ndr_size)
 diff --git a/src/windows-emulator/syscall_dispatcher.cpp b/src/windows-emulator/syscall_dispatcher.cpp
 index 56380af..77d6bf6 100644
 --- a/src/windows-emulator/syscall_dispatcher.cpp
