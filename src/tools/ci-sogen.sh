@@ -697,7 +697,9 @@ stage_build() {
              (not (find-package "DEXADOR.BACKEND.USOCKET")))
     (load (asdf:system-relative-pathname "dexador" "src/backend/usocket.lisp"))
     (setf (symbol-value (find-symbol "*DEXADOR-BACKEND*" "DEXADOR")) :usocket)
-    (format t "~&sogen: dexador's socket backend in place of WinHTTP~%")))
+    ;; The process's own stdout: quickload's :silent swallows *standard-output*.
+    (format sb-sys:*stdout* "~&sogen: dexador's socket backend in place of WinHTTP~%")
+    (finish-output sb-sys:*stdout*)))
 LISP
   GUEST_TRACE="${SOGEN_TRACE_BUILD:-}" GUEST_CWD='C:\work\nodecode\src' guest build "${SOGEN_BUILD_SECONDS:-5400}" \
     NODECODE_BUILD_COMMIT="$label" -- 'C:\sbcl\sbcl.exe' \
