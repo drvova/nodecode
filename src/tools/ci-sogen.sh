@@ -659,8 +659,12 @@ LISP
     sleep 2
     waited=$((waited + 2))
   done
+  # Two GETs from the runner: a listener that answers only its first
+  # connection fails the second.
   if [ -e "$c/temp/sockets-serving" ]; then
     echo "ci-sogen: sockets: the guest serves after ${waited}s; the runner's GET:" \
+      "$(curl -s -m 30 http://127.0.0.1:18083/ || echo "no answer (curl $?)")"
+    echo "ci-sogen: sockets: the runner's second GET:" \
       "$(curl -s -m 30 http://127.0.0.1:18083/ || echo "no answer (curl $?)")"
     touch "$c/temp/sockets-curled"
   fi

@@ -13,13 +13,23 @@ Each ALPC port a guest connects is named, a port nothing serves says so,
 and each RPC call is logged with its interface, opnum, transfer syntax,
 and the first bytes of its request and reply (the first 40 per
 interface). Every AFD request is logged with its endpoint, thread and
-status, and every completion of one left pending (the first 3000).
+status, every completion of one left pending, and an endpoint's
+WSAEventSelect state -- host poll events, mask, events now, events
+recorded, whether it signals -- each time it changes (the first 3000).
 
 diff --git a/src/windows-emulator/devices/afd_endpoint.cpp b/src/windows-emulator/devices/afd_endpoint.cpp
-index 7d35bed..28c2d3d 100644
+index 49725f5..dcee9ff 100644
 --- a/src/windows-emulator/devices/afd_endpoint.cpp
 +++ b/src/windows-emulator/devices/afd_endpoint.cpp
-@@ -523,6 +523,11 @@ namespace sogen
+@@ -438,6 +438,7 @@ namespace sogen
+             std::optional<handle> event_select_event_{};
+             ULONG event_select_mask_{0};
+             ULONG triggered_events_{0};
++            uint64_t debug_event_state_{0};
+ 
+             // Reflects the guest socket's blocking mode (FIONBIO). mswsock keeps this in its per-socket
+             // SOCK_SHARED_INFO and pushes the whole structure to the kernel via AFD_SET_CONTEXT; the
+@@ -523,6 +524,11 @@ namespace sogen
  
              void complete_io(windows_emulator& win_emu, const io_device_context& context, const NTSTATUS status)
              {
@@ -31,7 +41,29 @@ index 7d35bed..28c2d3d 100644
                  write_io_status(context, status);
                  if (auto* event = win_emu.process.events.get(context.event))
                  {
-@@ -800,7 +805,27 @@ namespace sogen
+@@ -721,6 +727,21 @@ namespace sogen
+                     ULONG current_events =
+                         map_socket_response_events_to_afd(socket_events, this->event_select_mask_, pfd.s->is_listening(), is_connecting);
+ 
++                    // Debug (nodecode spike, not for upstream): the event-select state, each time it changes.
++                    {
++                        const auto state = (static_cast<uint64_t>(static_cast<uint16_t>(socket_events)) << 48) |
++                                           (static_cast<uint64_t>(current_events) << 24) | this->triggered_events_;
++                        if (state != this->debug_event_state_ && debug_afd_budget())
++                        {
++                            this->debug_event_state_ = state;
++                            win_emu.log.error("AFD %p event-select: host 0x%x, mask 0x%x, now 0x%x, recorded 0x%x%s\n",
++                                              static_cast<const void*>(this), static_cast<unsigned>(socket_events),
++                                              static_cast<unsigned>(this->event_select_mask_), static_cast<unsigned>(current_events),
++                                              static_cast<unsigned>(this->triggered_events_),
++                                              (current_events & ~this->triggered_events_) != 0 ? " -> signal" : "");
++                        }
++                    }
++
+                     if ((current_events & ~this->triggered_events_) != 0)
+                     {
+                         this->triggered_events_ |= current_events;
+@@ -800,7 +821,27 @@ namespace sogen
                  return (FSCTL_AFD_BASE << 12) | ((write ? afd_file_write : afd_file_read) << 2);
              }
  

@@ -1,0 +1,82 @@
+Sogen: the calls that re-enable a WSAEventSelect event re-enable it
+
+WSAEventSelect records each network event once, until the call that
+re-enables it: an accept for FD_ACCEPT, a receive for FD_READ, a send
+for FD_WRITE. If the condition still holds then -- another connection
+waiting, more data -- the event is recorded and signaled again. Sogen's
+AFD cleared its recorded events only on WSAEnumNetworkEvents and a new
+WSAEventSelect, so an event recorded again after the enumeration, before
+the re-enabling call, stayed recorded with nothing to clear it, and its
+next occurrence was never signaled.
+
+usocket's wait-for-input on Windows waits on its WSAEventSelect event,
+enumerating the socket's events only when that is signaled, and
+hunchentoot's listener waits there for each connection; under Sogen a
+GET from the process to its own hunchentoot was never accepted.
+
+Accept, the stream and datagram receives (ReadFile on a socket
+included) and the sends now clear the event they re-enable.
+
+diff --git a/src/windows-emulator/devices/afd_endpoint.cpp b/src/windows-emulator/devices/afd_endpoint.cpp
+index 7d35bed..49725f5 100644
+--- a/src/windows-emulator/devices/afd_endpoint.cpp
++++ b/src/windows-emulator/devices/afd_endpoint.cpp
+@@ -1039,6 +1039,14 @@ namespace sogen
+                 return STATUS_SUCCESS;
+             }
+ 
++            // WSAEventSelect records an event once, until the call that re-enables it: an accept for FD_ACCEPT,
++            // a receive for FD_READ, a send for FD_WRITE. Should the condition still hold then -- another
++            // connection waiting, more data -- the next poll records and signals it again.
++            void reenable_events(const ULONG events)
++            {
++                this->triggered_events_ &= ~events;
++            }
++
+             NTSTATUS ioctl_accept(windows_emulator& win_emu, const io_device_context& c)
+             {
+                 if (!this->s_)
+@@ -1046,6 +1054,8 @@ namespace sogen
+                     throw std::runtime_error("Invalid AFD endpoint socket!");
+                 }
+ 
++                this->reenable_events(AFD_POLL_ACCEPT);
++
+                 if (c.input_buffer_length < sizeof(AFD_ACCEPT_INFO<Traits>))
+                 {
+                     return STATUS_BUFFER_TOO_SMALL;
+@@ -1138,6 +1148,7 @@ namespace sogen
+                                   const size_t transfer_size)
+             {
+                 auto& emu = win_emu.emu();
++                this->reenable_events(AFD_POLL_RECEIVE);
+ 
+                 std::vector<std::byte> host_buffer;
+                 host_buffer.resize(transfer_size);
+@@ -1234,6 +1245,8 @@ namespace sogen
+ 
+             NTSTATUS send_from(windows_emulator& win_emu, const io_device_context& c, const std::span<const std::byte> host_buffer)
+             {
++                this->reenable_events(AFD_POLL_SEND);
++
+                 if (host_buffer.empty())
+                 {
+                     if (c.io_status_block)
+@@ -1493,6 +1506,8 @@ namespace sogen
+                     throw std::runtime_error("Invalid AFD endpoint socket!");
+                 }
+ 
++                this->reenable_events(AFD_POLL_RECEIVE);
++
+                 auto& emu = win_emu.emu();
+ 
+                 if (c.input_buffer_length < sizeof(AFD_RECV_DATAGRAM_INFO<Traits>))
+@@ -1559,6 +1574,8 @@ namespace sogen
+                     throw std::runtime_error("Invalid AFD endpoint socket!");
+                 }
+ 
++                this->reenable_events(AFD_POLL_SEND);
++
+                 const auto& emu = win_emu.emu();
+ 
+                 if (c.input_buffer_length < sizeof(AFD_SEND_DATAGRAM_INFO<Traits>))
