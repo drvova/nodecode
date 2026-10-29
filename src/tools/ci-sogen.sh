@@ -576,16 +576,17 @@ EOF
 #
 # WinHTTP cannot send under Sogen -- the winhttp stage says how far it gets --
 # so this build's dexador talks HTTP through its socket backend, the one it
-# uses everywhere but Windows: right after quickload loads dexador, before
-# nodecode/bin's warm.lisp attaches to its own gateway, the backend is loaded
-# and made dexador's. The image this build dumps differs from the release's
-# in that alone.
+# uses everywhere but Windows: once quickload has loaded nodecode -- dexador,
+# usocket and cl+ssl, which the backend imports from and which on Windows
+# loads after dexador -- and before nodecode/bin's warm.lisp attaches to its
+# own gateway, the backend is loaded and made dexador's. The image this build
+# dumps differs from the release's in that alone.
 stage_build() {
   local rc=0
   cat > "$c/socket-backend.lisp" <<'LISP'
 (require :asdf)
 (defmethod asdf:perform :after ((operation asdf:load-op) (system asdf:system))
-  (when (and (string= (asdf:component-name system) "dexador")
+  (when (and (string= (asdf:component-name system) "nodecode")
              (not (find-package "DEXADOR.BACKEND.USOCKET")))
     (load (asdf:system-relative-pathname "dexador" "src/backend/usocket.lisp"))
     (setf (symbol-value (find-symbol "*DEXADOR-BACKEND*" "DEXADOR")) :usocket)
