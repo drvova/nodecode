@@ -1,0 +1,84 @@
+Sogen: ALPC message reserves round-trip
+
+rpcrt4 sets a message reserve aside on an ALPC port before an
+asynchronous LRPC call -- room for the reply to come -- with
+NtAlpcCreateResourceReserve, and drops it with
+NtAlpcDeleteResourceReserve. Sogen implemented neither, and an
+unimplemented system call stops the emulation: the first asynchronous
+call on a port did, here winnsi.dll's NSI change notification
+registration under WinHTTP's first send.
+
+Sogen's ports deliver a reply without a reserve, so a reserve is only an
+identifier, taken from the port's message identifiers, that the caller
+hands back.
+
+diff --git a/src/windows-emulator/syscalls.cpp b/src/windows-emulator/syscalls.cpp
+index 1575b1f..ce00dd6 100644
+--- a/src/windows-emulator/syscalls.cpp
++++ b/src/windows-emulator/syscalls.cpp
+@@ -296,6 +296,9 @@ namespace sogen
+         NTSTATUS handle_NtAlpcCreateSectionView(const syscall_context& c, handle port_handle, ULONG flags,
+                                                 emulator_object<ALPC_DATA_VIEW_ATTR<EmulatorTraits<Emu64>>> view_attributes);
+         NTSTATUS handle_NtAlpcDeleteSectionView(const syscall_context& c, handle port_handle, ULONG flags, uint64_t view_base);
++        NTSTATUS handle_NtAlpcCreateResourceReserve(const syscall_context& c, handle port_handle, ULONG flags, uint64_t message_size,
++                                                    emulator_object<handle> resource_id);
++        NTSTATUS handle_NtAlpcDeleteResourceReserve(const syscall_context& c, handle port_handle, ULONG flags, handle resource_id);
+ 
+         // syscalls/process.cpp:
+         NTSTATUS handle_NtQueryInformationProcess(const syscall_context& c, handle process_handle, uint32_t info_class,
+@@ -1934,6 +1937,8 @@ namespace sogen
+         add_handler(NtAlpcDeletePortSection);
+         add_handler(NtAlpcCreateSectionView);
+         add_handler(NtAlpcDeleteSectionView);
++        add_handler(NtAlpcCreateResourceReserve);
++        add_handler(NtAlpcDeleteResourceReserve);
+         add_handler(NtAlpcDeleteSecurityContext);
+         add_handler(NtSetSecurityObject);
+         add_handler(NtSetInformationDebugObject);
+diff --git a/src/windows-emulator/syscalls/port.cpp b/src/windows-emulator/syscalls/port.cpp
+index 0c3a0a4..c9d3dd1 100644
+--- a/src/windows-emulator/syscalls/port.cpp
++++ b/src/windows-emulator/syscalls/port.cpp
+@@ -173,6 +173,42 @@ namespace sogen
+             }
+         }
+ 
++        // A message reserve: room set aside on the port for a reply to come, which rpcrt4 takes before an
++        // asynchronous call. Sogen's ports deliver replies without one, so a reserve is only an identifier
++        // that round-trips.
++        NTSTATUS handle_NtAlpcCreateResourceReserve(const syscall_context& c, const handle port_handle, const ULONG flags,
++                                                    const uint64_t /*message_size*/, const emulator_object<handle> resource_id)
++        {
++            if (flags != 0)
++            {
++                return STATUS_INVALID_PARAMETER;
++            }
++            auto* container = c.proc.ports.get(port_handle);
++            if (!container)
++            {
++                return STATUS_INVALID_HANDLE;
++            }
++            auto* port = container->get_internal_port();
++            if (port->disconnected)
++            {
++                return STATUS_PORT_DISCONNECTED;
++            }
++            handle reserve{};
++            reserve.bits = container->allocate_message_id();
++            resource_id.write(reserve);
++            return STATUS_SUCCESS;
++        }
++
++        NTSTATUS handle_NtAlpcDeleteResourceReserve(const syscall_context& c, const handle port_handle, const ULONG flags,
++                                                    const handle /*resource_id*/)
++        {
++            if (flags != 0)
++            {
++                return STATUS_INVALID_PARAMETER;
++            }
++            return c.proc.ports.get(port_handle) ? STATUS_SUCCESS : STATUS_INVALID_HANDLE;
++        }
++
+         NTSTATUS handle_NtConnectPort(const syscall_context& c, const emulator_object<handle> client_port_handle,
+                                       const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> server_port_name,
+                                       const emulator_object<SECURITY_QUALITY_OF_SERVICE> /*security_qos*/,
