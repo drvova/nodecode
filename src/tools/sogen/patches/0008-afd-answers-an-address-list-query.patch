@@ -1,0 +1,87 @@
+Sogen: AFD answers an address list query
+
+WSAIoctl(SIO_ADDRESS_LIST_QUERY) lists the local transport addresses of a
+socket's family; mswsock asks AFD for it with AFD_ADDRESS_LIST_QUERY,
+passing the family and reading back a TRANSPORT_ADDRESS, or, given room
+for the count alone, the count and STATUS_BUFFER_OVERFLOW to size the
+caller's buffer. Sogen's AFD did not know the request and answered
+STATUS_NOT_SUPPORTED, which mswsock reports as WSAEOPNOTSUPP.
+
+WinHTTP's transport, webio.dll, asks before it sends, and stops there:
+WinHttpSendRequest to 127.0.0.1 failed with WSAEOPNOTSUPP (10045) without
+a byte on the wire, after "Unsupported AFD IOCTL: 0x120B3 (44)".
+
+The guest's sockets are the host's, so its one IPv4 address is
+loopback; an IPv6 list is empty, as a host without an IPv6 stack would
+have it.
+
+diff --git a/src/windows-emulator/devices/afd_endpoint.cpp b/src/windows-emulator/devices/afd_endpoint.cpp
+index bb83b53..7d35bed 100644
+--- a/src/windows-emulator/devices/afd_endpoint.cpp
++++ b/src/windows-emulator/devices/afd_endpoint.cpp
+@@ -838,6 +838,8 @@ namespace sogen
+                     return this->ioctl_poll(win_emu, c);
+                 case AFD_GET_ADDRESS:
+                     return this->ioctl_get_address(win_emu, c);
++                case AFD_ADDRESS_LIST_QUERY:
++                    return ioctl_address_list_query(win_emu, c);
+                 case AFD_GET_CONTEXT:
+                     return this->ioctl_get_context(win_emu, c);
+                 case AFD_EVENT_SELECT:
+@@ -1636,6 +1638,56 @@ namespace sogen
+                 return STATUS_SUCCESS;
+             }
+ 
++            // SIO_ADDRESS_LIST_QUERY: mswsock passes the socket's address family, a USHORT, and reads back a
++            // TRANSPORT_ADDRESS -- a LONG count, then per address a TA_ADDRESS: its length and family, USHORTs,
++            // and the sockaddr's bytes after the family -- or, given room for the count alone, the count and
++            // STATUS_BUFFER_OVERFLOW, which sizes the caller's buffer. The guest's sockets are the host's, so
++            // its one IPv4 address is loopback; an IPv6 host stack is not assumed.
++            static NTSTATUS ioctl_address_list_query(windows_emulator& win_emu, const io_device_context& c)
++            {
++                if (c.input_buffer_length < sizeof(USHORT))
++                {
++                    return STATUS_INVALID_PARAMETER;
++                }
++
++                if (c.output_buffer_length < sizeof(LONG))
++                {
++                    return STATUS_BUFFER_TOO_SMALL;
++                }
++
++                const auto family = win_emu.emu().read_memory<USHORT>(c.input_buffer);
++
++                std::vector<std::byte> list(sizeof(LONG));
++                if (family == 2)
++                {
++                    // sin_port, sin_addr 127.0.0.1, sin_zero
++                    constexpr std::array<uint8_t, 14> loopback{0, 0, 127, 0, 0, 1};
++                    constexpr LONG count = 1;
++                    constexpr USHORT length = loopback.size();
++                    std::memcpy(list.data(), &count, sizeof(count));
++                    const auto append = [&](const void* data, const size_t size) {
++                        const auto* bytes = static_cast<const std::byte*>(data);
++                        list.insert(list.end(), bytes, bytes + size);
++                    };
++                    append(&length, sizeof(length));
++                    append(&family, sizeof(family));
++                    append(loopback.data(), loopback.size());
++                }
++
++                const auto fits = c.output_buffer_length >= list.size();
++                const auto written = fits ? list.size() : sizeof(LONG);
++                win_emu.emu().write_memory(c.output_buffer, list.data(), written);
++
++                if (c.io_status_block)
++                {
++                    status_block block{};
++                    block.Information = static_cast<ULONG>(written);
++                    c.io_status_block.write(block);
++                }
++
++                return fits ? STATUS_SUCCESS : STATUS_BUFFER_OVERFLOW;
++            }
++
+             NTSTATUS ioctl_event_select(windows_emulator& win_emu, const io_device_context& c)
+             {
+                 if (!this->s_)

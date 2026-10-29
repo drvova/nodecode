@@ -79,19 +79,35 @@ jobs:
           wget -q https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh 22
-          sudo apt-get install -y --no-install-recommends clang-22 lld-22
+          sudo apt-get install -y --no-install-recommends clang-22 lld-22 ccache
+
+      # A patch changed recompiles the files it touches, not all of Sogen:
+      # ccache keeps each object file between runs.
+      - name: Restore the compiler cache
+        if: steps.sogen.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/ccache
+          key: sogen-ccache-${{ env.SOGEN_REV }}-${{ hashFiles('src/tools/sogen/patches/*.patch') }}
+          restore-keys: sogen-ccache-${{ env.SOGEN_REV }}-
 
       # The analyzer alone, without the parts a headless KVM run never uses:
       # the Rust backend (icicle), the Steam bridge and the SDL3 UI.
       - name: Build Sogen's analyzer
         if: steps.sogen.outputs.cache-hit != 'true'
         working-directory: sogen
+        # Precompiled headers off: ccache caches a file compiled against one
+        # only by trusting what it cannot check.
         env:
           CC: clang-22
           CXX: clang++-22
+          CCACHE_MAXSIZE: 2G
+          CCACHE_COMPILERCHECK: content
         run: |
-          cmake --preset=release -DSOGEN_ENABLE_RUST_CODE=OFF -DSOGEN_ENABLE_STEAM=OFF -DSOGEN_ENABLE_SDL3=OFF
+          cmake --preset=release -DSOGEN_ENABLE_RUST_CODE=OFF -DSOGEN_ENABLE_STEAM=OFF -DSOGEN_ENABLE_SDL3=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
           cmake --build --preset=release --target analyzer
+          ccache --show-stats
           mkdir -p ../sogen-bin
           cp -a build/release/artifacts/. ../sogen-bin/
           ls -la ../sogen-bin
@@ -102,6 +118,13 @@ jobs:
         with:
           path: sogen-bin
           key: ${{ steps.sogen.outputs.cache-primary-key }}
+
+      - name: Save the compiler cache
+        if: steps.sogen.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ccache
+          key: sogen-ccache-${{ env.SOGEN_REV }}-${{ hashFiles('src/tools/sogen/patches/*.patch') }}
 
       # The ready-made root Sogen's README names: the system DLLs and a
       # registry dump of a real Windows install.

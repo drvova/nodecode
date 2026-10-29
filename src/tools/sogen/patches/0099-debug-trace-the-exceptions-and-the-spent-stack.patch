@@ -5,9 +5,7 @@ its exception ring when a run ends; this keeps 512 instead of 32 and prints
 them when the run stops on a host error too, which a guest that runs off
 its stack's end does. A stack overflow also prints the code addresses that
 occur most on the stack between the stack pointer and the stack's top:
-module+offset for loaded images, the raw address for SBCL's spaces.
-
-diff --git a/src/windows-emulator/windows_emulator.cpp b/src/windows-emulator/windows_emulator.cpp
+module+offset for loaded images, the raw address for SBCL's spaces.diff --git a/src/windows-emulator/windows_emulator.cpp b/src/windows-emulator/windows_emulator.cpp
 index 7d3b1d7..f20a8aa 100644
 --- a/src/windows-emulator/windows_emulator.cpp
 +++ b/src/windows-emulator/windows_emulator.cpp
