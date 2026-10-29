@@ -1,0 +1,84 @@
+Sogen (debug, not for upstream): trace the exceptions and the spent stack
+
+For one run of nodecode's spike. SOGEN_TRACE_EXCEPTIONS=1 makes Sogen print
+its exception ring when a run ends; this keeps 512 instead of 32 and prints
+them when the run stops on a host error too, which a guest that runs off
+its stack's end does. A stack overflow also prints the code addresses that
+occur most on the stack between the stack pointer and the stack's top:
+module+offset for loaded images, the raw address for SBCL's spaces.
+
+diff --git a/src/windows-emulator/windows_emulator.cpp b/src/windows-emulator/windows_emulator.cpp
+index 7d3b1d7..f20a8aa 100644
+--- a/src/windows-emulator/windows_emulator.cpp
++++ b/src/windows-emulator/windows_emulator.cpp
+@@ -1396,6 +1396,42 @@ namespace sogen
+                 case stack_guard_outcome::exhausted:
+                     this->log.error("Stack overflow at 0x%llx on thread %u\n", static_cast<unsigned long long>(address),
+                                     static_cast<unsigned>(vcpu.thread().id));
++                    if (x64)
++                    {
++                        // Debug (nodecode spike, not for upstream): the code addresses most often on the spent
++                        // stack, which is where whatever recursed returns to.
++                        const auto rsp = x64->reg(x86_register::rsp);
++                        const auto top = vcpu.thread().teb64->read().NtTib.StackBase;
++                        std::map<uint64_t, uint32_t> counts{};
++                        for (auto at = rsp & ~7ULL; at + 8 <= top && at < rsp + 0x100000; at += 8)
++                        {
++                            uint64_t value{};
++                            if (!x64->try_read_memory(at, &value, sizeof(value)))
++                            {
++                                break;
++                            }
++                            if (this->mod_manager.find_by_address(value) || (value >= 0x50000000ULL && value < 0x60000000ULL) ||
++                                (value >= 0x1000000000ULL && value < 0x1300000000ULL))
++                            {
++                                ++counts[value];
++                            }
++                        }
++                        std::vector<std::pair<uint32_t, uint64_t>> ranked{};
++                        for (const auto& [value, n] : counts)
++                        {
++                            ranked.emplace_back(n, value);
++                        }
++                        std::ranges::sort(ranked, std::greater{});
++                        this->log.error("Stack overflow: rsp 0x%llx rip 0x%llx, the code addresses most on the stack:\n",
++                                        static_cast<unsigned long long>(rsp), static_cast<unsigned long long>(x64->read_instruction_pointer()));
++                        for (size_t i = 0; i < ranked.size() && i < 40; ++i)
++                        {
++                            const auto* mod = this->mod_manager.find_by_address(ranked[i].second);
++                            this->log.error("  %6u x 0x%llx %s+0x%llx\n", ranked[i].first, static_cast<unsigned long long>(ranked[i].second),
++                                            mod ? mod->name.c_str() : "lisp",
++                                            static_cast<unsigned long long>(mod ? ranked[i].second - mod->image_base : 0));
++                        }
++                    }
+                     dispatch_stack_overflow(*this, vcpu, address, operation);
+                     break;
+                 case stack_guard_outcome::not_on_stack:
+@@ -1723,6 +1759,14 @@ namespace sogen
+         std::vector<std::thread> workers{};
+         std::atomic<uint32_t> active_workers{0};
+ 
++        // Debug (nodecode spike, not for upstream): the trace of a run that stops on a host error, too.
++        const auto trace_on_throw = utils::finally([&] {
++            if (std::uncaught_exceptions() > 0)
++            {
++                this->dump_exception_trace();
++            }
++        });
++
+         const auto _ = utils::finally([&] {
+             {
+                 std::unique_lock lock{interrupt_mutex};
+diff --git a/src/windows-emulator/windows_emulator.hpp b/src/windows-emulator/windows_emulator.hpp
+index d245916..f2b2a81 100644
+--- a/src/windows-emulator/windows_emulator.hpp
++++ b/src/windows-emulator/windows_emulator.hpp
+@@ -658,7 +658,7 @@ namespace sogen
+         // current_thread(). See scoped_dispatch.
+         vcpu_context* dispatch_vcpu_{};
+ 
+-        std::array<exception_trace_entry, 32> exception_trace_{};
++        std::array<exception_trace_entry, 512> exception_trace_{};
+         size_t exception_trace_index_{0};
+ 
+         // unique_ptr because vcpu_context contains an atomic and must stay address-stable.

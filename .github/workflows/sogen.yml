@@ -129,6 +129,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends msitools sbcl p7zip-full unzip
 
       - name: Run the release's guest half under Sogen
+        # One debug run: Sogen prints its exception ring as each stage ends
+        # (patch 0099).
+        env:
+          SOGEN_TRACE_EXCEPTIONS: '1'
         run: |
           unzip -q sogen-root.zip -d sogen-root
           filesys="$(find "$PWD/sogen-root" -maxdepth 3 -type d -name filesys | head -n 1)"
