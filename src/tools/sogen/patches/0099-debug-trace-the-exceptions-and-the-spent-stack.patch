@@ -12,8 +12,53 @@ a failed open also names what it looked up (the first 300 of those).
 Each ALPC port a guest connects is named, a port nothing serves says so,
 and each RPC call is logged with its interface, opnum, transfer syntax,
 and the first bytes of its request and reply (the first 40 per
-interface).
+interface). Every AFD request is logged with its endpoint, thread and
+status, and every completion of one left pending (the first 3000).
 
+diff --git a/src/windows-emulator/devices/afd_endpoint.cpp b/src/windows-emulator/devices/afd_endpoint.cpp
+index 7d35bed..28c2d3d 100644
+--- a/src/windows-emulator/devices/afd_endpoint.cpp
++++ b/src/windows-emulator/devices/afd_endpoint.cpp
+@@ -523,6 +523,11 @@ namespace sogen
+ 
+             void complete_io(windows_emulator& win_emu, const io_device_context& context, const NTSTATUS status)
+             {
++                if (debug_afd_budget())
++                {
++                    win_emu.log.error("AFD %p request %u completes 0x%08X\n", static_cast<const void*>(this),
++                                      static_cast<unsigned>(_AFD_REQUEST(context.io_control_code)), static_cast<uint32_t>(status));
++                }
+                 write_io_status(context, status);
+                 if (auto* event = win_emu.process.events.get(context.event))
+                 {
+@@ -800,7 +805,27 @@ namespace sogen
+                 return (FSCTL_AFD_BASE << 12) | ((write ? afd_file_write : afd_file_read) << 2);
+             }
+ 
++            // Debug (nodecode spike, not for upstream): every AFD request and completion, the first 3000.
++            static bool debug_afd_budget()
++            {
++                static uint32_t lines = 0;
++                return ++lines <= 3000;
++            }
++
+             NTSTATUS io_control(windows_emulator& win_emu, const io_device_context& c) override
++            {
++                const auto status = this->dispatch_request(win_emu, c);
++                if (debug_afd_budget())
++                {
++                    win_emu.log.error("AFD %p request %u thread %u%s -> 0x%08X\n", static_cast<const void*>(this),
++                                      static_cast<unsigned>(_AFD_REQUEST(c.io_control_code)),
++                                      static_cast<unsigned>(c.vcpu && c.vcpu->active_thread ? c.thread().id : 0),
++                                      this->executing_delayed_ioctl_ ? " (retried)" : "", static_cast<uint32_t>(status));
++                }
++                return status;
++            }
++
++            NTSTATUS dispatch_request(windows_emulator& win_emu, const io_device_context& c)
+             {
+                 if (_AFD_BASE(c.io_control_code) != FSCTL_AFD_BASE)
+                 {
 diff --git a/src/windows-emulator/port.cpp b/src/windows-emulator/port.cpp
 index 25e5dcf..eb0dec9 100644
 --- a/src/windows-emulator/port.cpp
