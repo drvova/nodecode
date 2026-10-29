@@ -1,0 +1,123 @@
+Sogen: ReadFile and WriteFile on a non-blocking socket pend
+
+afd.sys serves a socket's IRP_MJ_READ and IRP_MJ_WRITE as overlapped
+requests, which pend until the socket is ready whatever its blocking
+mode. Sogen answered them as it answers a receive or a send on a
+non-blocking socket: STATUS_DEVICE_NOT_READY at once.
+
+WSAEventSelect makes a socket non-blocking, and accept gives the socket
+it returns the listener's mode. usocket waits for hunchentoot's
+connections that way, so each worker's socket was non-blocking; SBCL
+reads and writes sockets with ReadFile and WriteFile, and took the
+worker's first read before the client had written as an I/O error. The
+worker closed the connection: warm.lisp's WebSocket attach lost its
+socket after the handshake, and the build stopped at "the sync stream
+never replayed".
+
+ReadFile and WriteFile on a socket now pend on either mode; the
+receive and send requests keep their answer for a non-blocking socket.
+
+diff --git a/src/windows-emulator/devices/afd_endpoint.cpp b/src/windows-emulator/devices/afd_endpoint.cpp
+index 49725f5..6b715f2 100644
+--- a/src/windows-emulator/devices/afd_endpoint.cpp
++++ b/src/windows-emulator/devices/afd_endpoint.cpp
+@@ -647,10 +647,14 @@ namespace sogen
+ 
+             // For a non-blocking socket an operation that would block must complete immediately with
+             // STATUS_DEVICE_NOT_READY (mapped to WSAEWOULDBLOCK by mswsock); a blocking socket instead pends
+-            // the request and the delayed-ioctl machinery resumes it once the host socket is ready.
+-            NTSTATUS pend_or_would_block(windows_emulator& win_emu, const io_device_context& c, const bool require_poll)
++            // the request and the delayed-ioctl machinery resumes it once the host socket is ready. An
++            // overlapped request pends on either: afd.sys serves ReadFile and WriteFile on a socket that way,
++            // so a socket the guest made non-blocking -- WSAEventSelect does, and accept hands the listener's
++            // mode to the socket it returns -- still reads and writes as a file.
++            NTSTATUS pend_or_would_block(windows_emulator& win_emu, const io_device_context& c, const bool require_poll,
++                                         const bool overlapped)
+             {
+-                if (this->non_blocking_)
++                if (this->non_blocking_ && !overlapped)
+                 {
+                     return STATUS_DEVICE_NOT_READY;
+                 }
+@@ -1141,11 +1145,11 @@ namespace sogen
+                     return STATUS_INVALID_PARAMETER;
+                 }
+ 
+-                return this->receive_into(win_emu, c, buffers, transfer_size);
++                return this->receive_into(win_emu, c, buffers, transfer_size, false);
+             }
+ 
+             NTSTATUS receive_into(windows_emulator& win_emu, const io_device_context& c, const std::span<const EMU_WSABUF<Traits>> buffers,
+-                                  const size_t transfer_size)
++                                  const size_t transfer_size, const bool overlapped)
+             {
+                 auto& emu = win_emu.emu();
+                 this->reenable_events(AFD_POLL_RECEIVE);
+@@ -1160,7 +1164,7 @@ namespace sogen
+                     const auto error = this->s_->get_last_error();
+                     if (error == SERR(EWOULDBLOCK))
+                     {
+-                        return this->pend_or_would_block(win_emu, c, true);
++                        return this->pend_or_would_block(win_emu, c, true, overlapped);
+                     }
+ 
+                     if (error == SERR(ECONNRESET))
+@@ -1240,10 +1244,11 @@ namespace sogen
+                     }
+                 }
+ 
+-                return this->send_from(win_emu, c, host_buffer);
++                return this->send_from(win_emu, c, host_buffer, false);
+             }
+ 
+-            NTSTATUS send_from(windows_emulator& win_emu, const io_device_context& c, const std::span<const std::byte> host_buffer)
++            NTSTATUS send_from(windows_emulator& win_emu, const io_device_context& c, const std::span<const std::byte> host_buffer,
++                               const bool overlapped)
+             {
+                 this->reenable_events(AFD_POLL_SEND);
+ 
+@@ -1263,7 +1268,7 @@ namespace sogen
+                     const auto error = this->s_->get_last_error();
+                     if (error == SERR(EWOULDBLOCK))
+                     {
+-                        return this->pend_or_would_block(win_emu, c, false);
++                        return this->pend_or_would_block(win_emu, c, false, overlapped);
+                     }
+ 
+                     if (error == SERR(ECONNRESET))
+@@ -1307,7 +1312,7 @@ namespace sogen
+                 buffer.len = c.output_buffer_length;
+                 buffer.buf = static_cast<decltype(buffer.buf)>(c.output_buffer);
+                 return this->receive_into(win_emu, c, std::span{&buffer, 1},
+-                                          std::min<size_t>(buffer.len, max_stream_transfer_bytes));
++                                          std::min<size_t>(buffer.len, max_stream_transfer_bytes), true);
+             }
+ 
+             NTSTATUS file_write(windows_emulator& win_emu, const io_device_context& c)
+@@ -1323,7 +1328,7 @@ namespace sogen
+                     win_emu.emu().read_memory(c.input_buffer, host_buffer.data(), host_buffer.size());
+                 }
+ 
+-                return this->send_from(win_emu, c, host_buffer);
++                return this->send_from(win_emu, c, host_buffer, true);
+             }
+ 
+             static std::vector<const afd_endpoint*> resolve_endpoints(windows_emulator& win_emu,
+@@ -1537,7 +1542,7 @@ namespace sogen
+                     const auto error = this->s_->get_last_error();
+                     if (error == SERR(EWOULDBLOCK))
+                     {
+-                        return this->pend_or_would_block(win_emu, c, true);
++                        return this->pend_or_would_block(win_emu, c, true, false);
+                     }
+ 
+                     return STATUS_UNSUCCESSFUL;
+@@ -1607,7 +1612,7 @@ namespace sogen
+                     const auto error = this->s_->get_last_error();
+                     if (error == SERR(EWOULDBLOCK))
+                     {
+-                        return this->pend_or_would_block(win_emu, c, false);
++                        return this->pend_or_would_block(win_emu, c, false, false);
+                     }
+ 
+                     return STATUS_UNSUCCESSFUL;

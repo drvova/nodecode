@@ -18,7 +18,7 @@ WSAEventSelect state -- host poll events, mask, events now, events
 recorded, whether it signals -- each time it changes (the first 3000).
 
 diff --git a/src/windows-emulator/devices/afd_endpoint.cpp b/src/windows-emulator/devices/afd_endpoint.cpp
-index 49725f5..dcee9ff 100644
+index 6b715f2..af559ad 100644
 --- a/src/windows-emulator/devices/afd_endpoint.cpp
 +++ b/src/windows-emulator/devices/afd_endpoint.cpp
 @@ -438,6 +438,7 @@ namespace sogen
@@ -41,7 +41,7 @@ index 49725f5..dcee9ff 100644
                  write_io_status(context, status);
                  if (auto* event = win_emu.process.events.get(context.event))
                  {
-@@ -721,6 +727,21 @@ namespace sogen
+@@ -725,6 +731,21 @@ namespace sogen
                      ULONG current_events =
                          map_socket_response_events_to_afd(socket_events, this->event_select_mask_, pfd.s->is_listening(), is_connecting);
  
@@ -63,7 +63,7 @@ index 49725f5..dcee9ff 100644
                      if ((current_events & ~this->triggered_events_) != 0)
                      {
                          this->triggered_events_ |= current_events;
-@@ -800,7 +821,27 @@ namespace sogen
+@@ -804,7 +825,27 @@ namespace sogen
                  return (FSCTL_AFD_BASE << 12) | ((write ? afd_file_write : afd_file_read) << 2);
              }
  
