@@ -1,0 +1,141 @@
+Sogen: floating-point exceptions reach the guest as Windows raises them
+
+The x64 interrupt hook turned vectors 0, 1, 3, 6, 41 and 45 into Windows
+exceptions and only logged the rest. So an x87 floating-point error (#MF,
+16) or an SSE floating-point exception (#XM, 19) was logged ("Interrupt 16")
+and the instruction resumed -- and an x87 exception stays pending until the
+status word is cleared, so it was raised again at once, forever.
+
+A runtime that unmasks floating-point traps meets it as soon as a float
+overflows. SBCL does: it unmasks overflow, invalid and divide-by-zero in
+the x87 control word and MXCSR, maps Windows' STATUS_FLOAT_* codes to Lisp
+arithmetic errors, and its compiler handles those while folding constants.
+Building nodecode under Sogen went silent seven minutes in and was killed at
+the 90-minute limit; its log's last 20000 lines were all "Interrupt 16".
+
+Both vectors now dispatch the exception Windows reports for the pending,
+unmasked flags: invalid operation first (a stack check when the x87 stack
+faulted), then divide by zero, denormal operand, overflow, underflow,
+inexact result. For #MF the pending state goes with the CONTEXT just laid
+and is cleared from the CPU, so the handler's own x87 code does not raise it
+again; an SSE exception is precise and leaves nothing pending.
+
+diff --git a/src/emulator-platform/platform/status.hpp b/src/emulator-platform/platform/status.hpp
+index f191ef5..a6cb9ab 100644
+--- a/src/emulator-platform/platform/status.hpp
++++ b/src/emulator-platform/platform/status.hpp
+@@ -24,6 +24,13 @@ namespace sogen
+ #define STATUS_INVALID_PARAMETER      ((NTSTATUS)0xC000000DL)
+ #define STATUS_ILLEGAL_INSTRUCTION    ((NTSTATUS)0xC000001DL)
+ #define STATUS_INTEGER_DIVIDE_BY_ZERO ((NTSTATUS)0xC0000094L)
++#define STATUS_FLOAT_DENORMAL_OPERAND  ((NTSTATUS)0xC000008DL)
++#define STATUS_FLOAT_DIVIDE_BY_ZERO    ((NTSTATUS)0xC000008EL)
++#define STATUS_FLOAT_INEXACT_RESULT    ((NTSTATUS)0xC000008FL)
++#define STATUS_FLOAT_INVALID_OPERATION ((NTSTATUS)0xC0000090L)
++#define STATUS_FLOAT_OVERFLOW          ((NTSTATUS)0xC0000091L)
++#define STATUS_FLOAT_STACK_CHECK       ((NTSTATUS)0xC0000092L)
++#define STATUS_FLOAT_UNDERFLOW         ((NTSTATUS)0xC0000093L)
+ #define STATUS_ASSERTION_FAILURE      ((NTSTATUS)0xC0000420L)
+ #endif
+ 
+diff --git a/src/windows-emulator/exception_dispatch.cpp b/src/windows-emulator/exception_dispatch.cpp
+index 38f1b3c..dca8399 100644
+--- a/src/windows-emulator/exception_dispatch.cpp
++++ b/src/windows-emulator/exception_dispatch.cpp
+@@ -382,6 +382,66 @@ namespace sogen
+         dispatch_exception(win_emu, vcpu, STATUS_INTEGER_DIVIDE_BY_ZERO, {});
+     }
+ 
++    namespace
++    {
++        // The exception Windows reports for a set of pending, unmasked floating-point exception flags (the low
++        // six bits of the x87 status word or of MXCSR): invalid operation first -- a stack check when the x87
++        // stack faulted -- then divide by zero, denormal operand, overflow, underflow, inexact result.
++        DWORD floating_point_status(const uint32_t pending, const bool stack_fault)
++        {
++            if (pending & 0x01)
++            {
++                return static_cast<DWORD>(stack_fault ? STATUS_FLOAT_STACK_CHECK : STATUS_FLOAT_INVALID_OPERATION);
++            }
++            if (pending & 0x04)
++            {
++                return static_cast<DWORD>(STATUS_FLOAT_DIVIDE_BY_ZERO);
++            }
++            if (pending & 0x02)
++            {
++                return static_cast<DWORD>(STATUS_FLOAT_DENORMAL_OPERAND);
++            }
++            if (pending & 0x08)
++            {
++                return static_cast<DWORD>(STATUS_FLOAT_OVERFLOW);
++            }
++            if (pending & 0x10)
++            {
++                return static_cast<DWORD>(STATUS_FLOAT_UNDERFLOW);
++            }
++            if (pending & 0x20)
++            {
++                return static_cast<DWORD>(STATUS_FLOAT_INEXACT_RESULT);
++            }
++            return static_cast<DWORD>(STATUS_FLOAT_INVALID_OPERATION);
++        }
++    }
++
++    // #MF: an x87 instruction found an unmasked exception pending from an earlier one.
++    void dispatch_x87_floating_point_error(windows_emulator& win_emu, vcpu_context& vcpu)
++    {
++        auto& cpu = vcpu.x64_cpu();
++        const auto status_word = cpu.reg<uint16_t>(x86_register::fpsw);
++        const auto control_word = cpu.reg<uint16_t>(x86_register::fpcw);
++        const auto pending = static_cast<uint32_t>(status_word & ~control_word & 0x3F);
++        dispatch_exception(win_emu, vcpu, floating_point_status(pending, (status_word & 0x40) != 0), {});
++
++        // The exception stays pending until the status word is cleared, and the next x87 instruction -- the
++        // handler's own -- would raise #MF again: it goes with the CONTEXT just laid, not with the CPU. Left
++        // pending, the guest re-raised it forever, as Sogen logged "Interrupt 16" and resumed the instruction.
++        cpu.reg<uint16_t>(x86_register::fpsw, static_cast<uint16_t>(status_word & ~0x80FF));
++    }
++
++    // #XM: an SSE instruction raised an unmasked exception. SSE exceptions are precise, so nothing stays
++    // pending in the CPU.
++    void dispatch_simd_floating_point_exception(windows_emulator& win_emu, vcpu_context& vcpu)
++    {
++        auto& cpu = vcpu.x64_cpu();
++        const auto mxcsr = cpu.reg<uint32_t>(x86_register::mxcsr);
++        const auto pending = mxcsr & ~(mxcsr >> 7) & 0x3F;
++        dispatch_exception(win_emu, vcpu, floating_point_status(pending, false), {});
++    }
++
+     void dispatch_single_step(windows_emulator& win_emu, vcpu_context& vcpu)
+     {
+         dispatch_exception(win_emu, vcpu, STATUS_SINGLE_STEP, {});
+diff --git a/src/windows-emulator/exception_dispatch.hpp b/src/windows-emulator/exception_dispatch.hpp
+index 392fee3..6c33a83 100644
+--- a/src/windows-emulator/exception_dispatch.hpp
++++ b/src/windows-emulator/exception_dispatch.hpp
+@@ -37,6 +37,8 @@ namespace sogen
+     void dispatch_guard_page_violation(windows_emulator& win_emu, vcpu_context& vcpu, uint64_t address, memory_operation operation);
+     void dispatch_illegal_instruction_violation(windows_emulator& win_emu, vcpu_context& vcpu);
+     void dispatch_integer_division_by_zero(windows_emulator& win_emu, vcpu_context& vcpu);
++    void dispatch_x87_floating_point_error(windows_emulator& win_emu, vcpu_context& vcpu);
++    void dispatch_simd_floating_point_exception(windows_emulator& win_emu, vcpu_context& vcpu);
+     void dispatch_single_step(windows_emulator& win_emu, vcpu_context& vcpu);
+     void dispatch_breakpoint(windows_emulator& win_emu, vcpu_context& vcpu);
+ 
+diff --git a/src/windows-emulator/windows_emulator.cpp b/src/windows-emulator/windows_emulator.cpp
+index 2e44963..7aed3a0 100644
+--- a/src/windows-emulator/windows_emulator.cpp
++++ b/src/windows-emulator/windows_emulator.cpp
+@@ -1579,6 +1579,12 @@ namespace sogen
+                 this->callbacks.on_suspicious_activity("Illegal instruction");
+                 dispatch_illegal_instruction_violation(*this, vcpu);
+                 return;
++            case 16:
++                dispatch_x87_floating_point_error(*this, vcpu);
++                return;
++            case 19:
++                dispatch_simd_floating_point_exception(*this, vcpu);
++                return;
+             case 41:
+                 this->callbacks.on_fast_fail(acting.reg<uint32_t>(x86_register::ecx));
+                 this->process.exit_status = STATUS_FAIL_FAST_EXCEPTION;
