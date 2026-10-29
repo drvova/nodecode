@@ -584,14 +584,26 @@ stage_sockets() {
   server=$!
   cat > "$c/sockets.lisp" <<'LISP'
 ;; warm.lisp's attach, a step at a time, over dexador's socket backend: each
-;; step bounded, and a watchdog naming the step every 30 seconds, so a hang
-;; says where it is. Lines go to the process's own stdout: quickload's
+;; step bounded, and a watchdog naming the step every 30 seconds and ending
+;; the process three minutes into one, so a hang says where it is. Lines go to the process's own stdout: quickload's
 ;; :silent would swallow *standard-output*.
 (defvar *step* "loading")
 (defun note (control &rest args)
   (format sb-sys:*stdout* "~&sockets: ~?~%" control args)
   (finish-output sb-sys:*stdout*))
-(sb-thread:make-thread (lambda () (loop (sleep 30) (note "still in ~a" *step*))) :name "sockets watchdog")
+(sb-thread:make-thread
+ (lambda ()
+   (let ((last nil) (since 0))
+     (loop
+       (sleep 30)
+       (if (eq *step* last) (incf since 30) (setf last *step* since 30))
+       (note "still in ~a" *step*)
+       ;; Past three minutes in one step (loading aside) the step is stuck:
+       ;; end the process rather than spend the stage's bound.
+       (when (and (> since 180) (not (equal *step* "loading")))
+         (note "~a: stuck, giving up" *step*)
+         (sb-ext:exit :code 3 :abort t)))))
+ :name "sockets watchdog")
 
 (defmacro bounded ((name seconds) &body body)
   `(progn
