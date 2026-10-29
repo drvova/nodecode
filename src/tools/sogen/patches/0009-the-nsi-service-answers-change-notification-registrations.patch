@@ -1,0 +1,297 @@
+Sogen: the NSI service answers change notification registrations
+
+iphlpapi's change notifications -- NotifyIpInterfaceChange,
+NotifyUnicastIpAddressChange and their kin -- go through winnsi.dll on
+this build: asynchronous NDR64 RPC to the Network Store Interface
+service, interface 7ea70bcf-48af-4f6a-8968-6a440754d5fa, over ncalrpc
+with no endpoint of its own, so rpcrt4 first asks the endpoint mapper
+for one. WinHTTP's transport, webio.dll, registers for both before its
+first send, and Sogen ran no NSI service.
+
+Nor could its endpoint mapper have named one. Its ept_map read the
+request as two pointers and a handle, so it took the map tower's bytes
+for max_towers and answered with them as its array's maximum count; the
+client rejects a count that is not its own max_towers, and the send
+failed with RPC_X_BAD_STUB_DATA (1783). The request is an object UUID,
+the map tower as a twr_t, the entry handle, a null pointer and
+max_towers, in both NDR and NDR64.
+
+The endpoint mapper now reads it so, and answers a tower for an
+interface Sogen serves with the client's own tower, its endpoint floor
+naming the port; any other is still not registered. The NSI port takes
+winnsi's registration (opnum 5) and deregistration (opnum 6) with a
+success status and keeps the change wait (opnum 7) outstanding: Sogen's
+network does not change under the guest, so the notification never
+comes. Keeping a call is new for an asynchronous send: a server that
+answers STATUS_PENDING queues no reply. NSI's parameter calls carry data
+Sogen does not have and are refused.
+
+diff --git a/src/windows-emulator/port.cpp b/src/windows-emulator/port.cpp
+index 6feda1a..25e5dcf 100644
+--- a/src/windows-emulator/port.cpp
++++ b/src/windows-emulator/port.cpp
+@@ -11,6 +11,7 @@
+ #include "ports/lsa_policy_lookup.hpp"
+ #include "ports/local_object_exporter.hpp"
+ #include "ports/protected_storage.hpp"
++#include "ports/network_store.hpp"
+ #include "ports/service_control.hpp"
+ #include "ports/sspi_rpc.hpp"
+ #include "binary_writer.hpp"
+@@ -361,6 +362,11 @@ namespace sogen
+             return create_sspi_rpc_port();
+         }
+ 
++        if (port == network_store_port_name)
++        {
++            return create_network_store_port();
++        }
++
+         if (port == u"\\RPC Control\\umpo")
+         {
+             // User-Mode Power Orchestrator. The audio stack registers a power request here while starting a
+@@ -483,6 +489,13 @@ namespace sogen
+ 
+         if (!c.receive_message)
+         {
++            // A server that keeps the call -- an RPC answered only when something changes -- has nothing to
++            // send back yet; the sender's message is taken.
++            if (result.status == STATUS_PENDING)
++            {
++                return {.status = STATUS_SUCCESS};
++            }
++
+             if (this->completion_port_.bits == 0 || !NT_SUCCESS(result.status))
+             {
+                 return {.status = result.status};
+diff --git a/src/windows-emulator/ports/local_object_exporter.cpp b/src/windows-emulator/ports/local_object_exporter.cpp
+index c3cedd5..0d825c7 100644
+--- a/src/windows-emulator/ports/local_object_exporter.cpp
++++ b/src/windows-emulator/ports/local_object_exporter.cpp
+@@ -1,5 +1,6 @@
+ #include "../std_include.hpp"
+ #include "local_object_exporter.hpp"
++#include "network_store.hpp"
+ #include "../windows_emulator.hpp"
+ #include <binary_writer.hpp>
+ 
+@@ -142,11 +143,11 @@ namespace sogen
+                     {
+                         return STATUS_ACCESS_VIOLATION;
+                     }
+-                    connect_reader reader(request, writer.pointer_size());
+                     if (interface_id == endpoint_mapper_interface)
+                     {
+-                        return map_endpoint(procedure, reader, writer);
++                        return map_endpoint(procedure, request, writer);
+                     }
++                    connect_reader reader(request, writer.pointer_size());
+                     if (procedure == 6)
+                     {
+                         return this->allocate_apartment(win_emu, reader, writer);
+@@ -238,24 +239,115 @@ namespace sogen
+                 }
+             };
+ 
+-            static NTSTATUS map_endpoint(const uint32_t procedure, connect_reader& reader, utils::aligned_binary_writer& writer)
++            // The endpoint a map tower asks for, when its interface is one Sogen serves: the client's own tower
++            // (floor count, then per floor a length-prefixed left and right side) with the endpoint floor, an
++            // ncalrpc tower's fourth, naming the port.
++            static std::optional<std::vector<uint8_t>> map_tower(const std::span<const uint8_t> tower)
++            {
++                struct floor
++                {
++                    std::span<const uint8_t> lhs;
++                    std::span<const uint8_t> rhs;
++                };
++
++                size_t offset = 0;
++                const auto take = [&](const size_t size) {
++                    if (size > tower.size() - offset)
++                    {
++                        throw std::out_of_range("Truncated map tower");
++                    }
++                    const auto part = tower.subspan(offset, size);
++                    offset += size;
++                    return part;
++                };
++                const auto take_u16 = [&] {
++                    uint16_t value{};
++                    std::memcpy(&value, take(sizeof(value)).data(), sizeof(value));
++                    return value;
++                };
++
++                const auto floor_count = take_u16();
++                std::vector<floor> floors{};
++                for (uint16_t i = 0; i < floor_count; ++i)
++                {
++                    const auto lhs = take(take_u16());
++                    const auto rhs = take(take_u16());
++                    floors.push_back({lhs, rhs});
++                }
++
++                constexpr uint8_t uuid_floor = 0x0d;
++                constexpr uint8_t ncalrpc_floor = 0x0c;
++                constexpr uint8_t endpoint_floor = 0x10;
++                if (floors.size() < 4 || floors[0].lhs.size() < 17 || floors[0].lhs[0] != uuid_floor ||
++                    !std::ranges::equal(floors[0].lhs.subspan(1, 16), network_store_interface) || floors[2].lhs.size() != 1 ||
++                    floors[2].lhs[0] != ncalrpc_floor || floors[3].lhs.size() != 1 || floors[3].lhs[0] != endpoint_floor)
++                {
++                    return std::nullopt;
++                }
++
++                std::vector<uint8_t> endpoint(network_store_endpoint.begin(), network_store_endpoint.end());
++                endpoint.push_back(0);
++                floors[3].rhs = endpoint;
++
++                std::vector<uint8_t> mapped{};
++                const auto append = [&](const void* data, const size_t size) {
++                    const auto* bytes = static_cast<const uint8_t*>(data);
++                    mapped.insert(mapped.end(), bytes, bytes + size);
++                };
++                append(&floor_count, sizeof(floor_count));
++                for (const auto& [lhs, rhs] : floors)
++                {
++                    const auto lhs_size = static_cast<uint16_t>(lhs.size());
++                    const auto rhs_size = static_cast<uint16_t>(rhs.size());
++                    append(&lhs_size, sizeof(lhs_size));
++                    append(lhs.data(), lhs.size());
++                    append(&rhs_size, sizeof(rhs_size));
++                    append(rhs.data(), rhs.size());
++                }
++                return mapped;
++            }
++
++            // ept_map and its authenticated forms ask with an object UUID, the map tower (a twr_t: its
++            // conformance, its length, its octets), the entry handle, a null pointer and the most towers the
++            // caller takes, which is the request's last field. They answer with the entry handle, the tower
++            // count, the towers -- a conformant varying array of tower pointers, each pointee a twr_t -- and a
++            // status: one tower for an interface Sogen serves, "not registered" for any other.
++            static NTSTATUS map_endpoint(const uint32_t procedure, const std::span<const uint8_t> request,
++                                         utils::aligned_binary_writer& writer)
+             {
+                 if (std::ranges::find(endpoint_mapper_map_procedures, procedure) == endpoint_mapper_map_procedures.end())
+                 {
+                     return STATUS_NOT_SUPPORTED;
+                 }
+ 
+-                (void)reader.pointer();
+-                (void)reader.pointer();
+-                (void)reader.read<std::array<uint8_t, 20>>();
+-                const auto maximum_towers = reader.read<uint32_t>();
++                connect_reader reader(request, writer.pointer_size());
++                (void)reader.read<std::array<uint8_t, 16>>();
++                const auto conformance = reader.pointer();
++                const auto tower_length = reader.read<uint32_t>();
++                const auto rest = reader.remaining();
++                if (conformance != tower_length || tower_length > rest.size() || request.size() < sizeof(uint32_t))
++                {
++                    throw std::out_of_range("Invalid endpoint mapper request");
++                }
++
++                uint32_t maximum_towers{};
++                std::memcpy(&maximum_towers, request.data() + request.size() - sizeof(maximum_towers), sizeof(maximum_towers));
++
++                const auto mapped = maximum_towers != 0 ? map_tower(rest.first(tower_length)) : std::nullopt;
+ 
+                 writer.write(std::array<uint8_t, 20>{});
+-                writer.write<uint32_t>(0);
++                writer.write<uint32_t>(mapped ? 1 : 0);
+                 writer.write_pointer_sized(maximum_towers);
+                 writer.write_pointer_sized(0);
+-                writer.write_pointer_sized(0);
+-                writer.write<uint32_t>(endpoint_not_registered);
++                writer.write_pointer_sized(mapped ? 1 : 0);
++                if (mapped)
++                {
++                    writer.write_ndr_pointer(true);
++                    writer.write_pointer_sized(mapped->size());
++                    writer.write<uint32_t>(static_cast<uint32_t>(mapped->size()));
++                    writer.write(mapped->data(), mapped->size());
++                }
++                writer.write<uint32_t>(mapped ? 0 : endpoint_not_registered);
+                 return STATUS_SUCCESS;
+             }
+ 
+diff --git a/src/windows-emulator/ports/network_store.cpp b/src/windows-emulator/ports/network_store.cpp
+new file mode 100644
+index 0000000..7e87029
+--- /dev/null
++++ b/src/windows-emulator/ports/network_store.cpp
+@@ -0,0 +1,54 @@
++#include "../std_include.hpp"
++#include "network_store.hpp"
++
++#include "binary_writer.hpp"
++#include "../windows_emulator.hpp"
++
++namespace sogen
++{
++    namespace
++    {
++        // The opnums winnsi.dll calls for iphlpapi's change notifications (NotifyIpInterfaceChange,
++        // NotifyUnicastIpAddressChange and their kin): it registers with opnum 5 and waits for that to
++        // complete, then leaves opnum 7 outstanding -- an asynchronous call the service completes when the
++        // watched object changes -- and deregisters with opnum 6. Each answers a status.
++        constexpr uint32_t register_change_notification = 5;
++        constexpr uint32_t deregister_change_notification = 6;
++        constexpr uint32_t wait_for_change = 7;
++
++        // Sogen's network does not change under the guest, so a registration succeeds and its notification
++        // never comes. The interface's other calls read and write NSI parameters, whose replies carry data
++        // this does not have; those are refused.
++        struct network_store_port : rpc_port
++        {
++            NTSTATUS handle_rpc(windows_emulator& /*win_emu*/, const uint32_t procedure_id, const lpc_request_context& /*c*/,
++                                utils::aligned_binary_writer& writer, std::vector<alpc_reply_handle>& /*reply_handles*/) override
++            {
++                if (this->bound_interface() != network_store_interface)
++                {
++                    return STATUS_NOT_SUPPORTED;
++                }
++
++                if (procedure_id == wait_for_change)
++                {
++                    return STATUS_PENDING;
++                }
++
++                if (procedure_id != register_change_notification && procedure_id != deregister_change_notification)
++                {
++                    return STATUS_NOT_SUPPORTED;
++                }
++
++                writer.align_to(sizeof(uint32_t));
++                writer.write<uint32_t>(0);
++                return STATUS_SUCCESS;
++            }
++        };
++    }
++
++    std::unique_ptr<port> create_network_store_port()
++    {
++        return std::make_unique<network_store_port>();
++    }
++
++} // namespace sogen
+diff --git a/src/windows-emulator/ports/network_store.hpp b/src/windows-emulator/ports/network_store.hpp
+new file mode 100644
+index 0000000..8c4bae5
+--- /dev/null
++++ b/src/windows-emulator/ports/network_store.hpp
+@@ -0,0 +1,16 @@
++#pragma once
++
++#include "../port.hpp"
++
++namespace sogen
++{
++    // The Network Store Interface service's RPC interface, {7ea70bcf-48af-4f6a-8968-6a440754d5fa} v1.0, and
++    // the ncalrpc endpoint the endpoint mapper resolves it to: winnsi.dll binds with no endpoint of its own.
++    constexpr std::array<uint8_t, 16> network_store_interface{0xcf, 0x0b, 0xa7, 0x7e, 0xaf, 0x48, 0x6a, 0x4f,
++                                                              0x89, 0x68, 0x6a, 0x44, 0x07, 0x54, 0xd5, 0xfa};
++    constexpr std::string_view network_store_endpoint = "SogenNsi";
++    constexpr std::u16string_view network_store_port_name = u"\\RPC Control\\SogenNsi";
++
++    std::unique_ptr<port> create_network_store_port();
++
++} // namespace sogen

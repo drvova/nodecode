@@ -15,10 +15,10 @@ and the first bytes of its request and reply (the first 40 per
 interface).
 
 diff --git a/src/windows-emulator/port.cpp b/src/windows-emulator/port.cpp
-index 6feda1a..1362745 100644
+index 25e5dcf..eb0dec9 100644
 --- a/src/windows-emulator/port.cpp
 +++ b/src/windows-emulator/port.cpp
-@@ -34,8 +34,8 @@ namespace sogen
+@@ -35,8 +35,8 @@ namespace sogen
  
              lpc_request_result handle_request(windows_emulator& win_emu, const lpc_request_context&) override
              {
@@ -29,7 +29,7 @@ index 6feda1a..1362745 100644
                  return STATUS_NOT_SUPPORTED;
              }
  
-@@ -298,6 +298,9 @@ namespace sogen
+@@ -299,6 +299,9 @@ namespace sogen
  
      std::unique_ptr<port> create_port(const std::u16string_view port)
      {
@@ -39,7 +39,7 @@ index 6feda1a..1362745 100644
          if (port == u"\\Windows\\ApiPort")
          {
              return create_api_port();
-@@ -720,6 +723,33 @@ namespace sogen
+@@ -733,6 +736,33 @@ namespace sogen
          std::vector<alpc_reply_handle> reply_handles;
          const auto status = this->handle_rpc(win_emu, *procedure_id, rpc_context, writer, reply_handles);
  
