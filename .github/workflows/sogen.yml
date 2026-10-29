@@ -146,6 +146,16 @@ jobs:
           path: sogen-root.zip
           key: ${{ steps.root.outputs.cache-primary-key }}
 
+      # What ci-sogen.sh downloads for the guest -- SBCL, PortableGit, SQLite
+      # and the DLLs the emulation root lacks -- kept between runs, so one
+      # mirror's outage does not fail a run.
+      - name: Restore the guest's downloads
+        uses: actions/cache/restore@v4
+        with:
+          path: sogen-downloads
+          key: sogen-downloads-${{ hashFiles('src/tools/ci-sogen.sh', 'src/tools/build-windows.ps1') }}
+          restore-keys: sogen-downloads-
+
       - name: Install the host tools
         run: |
           sudo apt-get update -q
@@ -158,11 +168,19 @@ jobs:
         env:
           SOGEN_TRACE_EXCEPTIONS: '1'
           SOGEN_SKIP_BUILD: '1'
+          SOGEN_DOWNLOADS: ${{ github.workspace }}/sogen-downloads
         run: |
           unzip -q sogen-root.zip -d sogen-root
           filesys="$(find "$PWD/sogen-root" -maxdepth 3 -type d -name filesys | head -n 1)"
           [ -n "$filesys" ] || { echo 'no filesys/ in the emulation root'; find sogen-root -maxdepth 2; exit 1; }
           src/tools/ci-sogen.sh sogen-bin/analyzer "$(dirname "$filesys")" dist/sogen
+
+      - name: Save the guest's downloads
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: sogen-downloads
+          key: sogen-downloads-${{ hashFiles('src/tools/ci-sogen.sh', 'src/tools/build-windows.ps1') }}
 
       - name: Upload the logs
         if: always()

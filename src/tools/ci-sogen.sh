@@ -63,7 +63,22 @@ c="$work/c" # the guest's C:\work
 tree="$c/nodecode"
 mkdir -p "$c/home" "$c/cache" "$c/temp" "$c/out" "$c/trialhome" "$tree" "$work/dl"
 
-fetch() { curl -fsSL --retry 3 -o "$1" "$2"; }
+# fetch FILE URL. With SOGEN_DOWNLOADS, a directory kept between runs, a URL
+# already fetched there is copied from it instead, so a mirror's outage costs
+# nothing once the run before it got through.
+fetch() {
+  if [ -z "${SOGEN_DOWNLOADS:-}" ]; then
+    curl -fsSL --retry 3 -o "$1" "$2"
+    return
+  fi
+  local kept
+  kept="$SOGEN_DOWNLOADS/$(printf '%s' "$2" | sha256sum | cut -c1-16)-$(basename "$2")"
+  if [ ! -s "$kept" ]; then
+    mkdir -p "$SOGEN_DOWNLOADS"
+    curl -fsSL --retry 3 -o "$kept.part" "$2" && mv "$kept.part" "$kept"
+  fi
+  cp "$kept" "$1"
+}
 
 # --- what the guest runs -------------------------------------------------------
 echo "ci-sogen: SBCL $sbcl_version, PortableGit $git_version, $(basename "$sqlite_url")"
