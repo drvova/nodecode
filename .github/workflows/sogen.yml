@@ -129,6 +129,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends msitools sbcl p7zip-full unzip
 
       - name: Run the release's guest half under Sogen
+        # Diagnostic, for one run: run 40785317924's build went silent seven
+        # minutes in and was killed at the 90-minute limit. Trace it, and stop
+        # it at 20 minutes, so the log's tail shows what it waits on.
+        env:
+          SOGEN_TRACE_BUILD: '1'
+          SOGEN_BUILD_SECONDS: '1200'
         run: |
           unzip -q sogen-root.zip -d sogen-root
           filesys="$(find "$PWD/sogen-root" -maxdepth 3 -type d -name filesys | head -n 1)"

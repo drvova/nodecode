@@ -410,10 +410,25 @@ EOF
   [ "$red" = 0 ]
 }
 
+# SOGEN_BUILD_SECONDS bounds the build (default 90 minutes). SOGEN_TRACE_BUILD=1
+# runs it under Sogen's whole log and keeps the log's tail: where a build that
+# hangs stops is what it is waiting on.
 stage_build() {
-  GUEST_CWD='C:\work\nodecode\src' guest build 5400 NODECODE_BUILD_COMMIT="$label" -- 'C:\sbcl\sbcl.exe' \
+  local rc=0
+  GUEST_TRACE="${SOGEN_TRACE_BUILD:-}" GUEST_CWD='C:\work\nodecode\src' guest build "${SOGEN_BUILD_SECONDS:-5400}" \
+    NODECODE_BUILD_COMMIT="$label" -- 'C:\sbcl\sbcl.exe' \
     --dynamic-space-size 8192 --control-stack-size 8MB --noinform --non-interactive \
-    --load 'C:\work\nodecode\src\tools\windows-release.lisp' || return 1
+    --load 'C:\work\nodecode\src\tools\windows-release.lisp' || rc=1
+  if [ "${SOGEN_TRACE_BUILD:-}" = 1 ]; then
+    echo "ci-sogen: the build's threads, under Sogen's whole log:"
+    grep -i -E 'thread (created|terminated|exit)|switch' "$out/build.out" | tail -n 30
+    echo "ci-sogen: the syscalls in the last 5000 lines of that log:"
+    tail -n 5000 "$out/build.out" | grep -o 'Executing syscall: [A-Za-z0-9_]*' | sort | uniq -c | sort -rn | head -n 15
+    echo "ci-sogen: the last of it:"
+    tail -n 120 "$out/build.out"
+    tail -n 20000 "$out/build.out" > "$out/build.out.tail" && mv "$out/build.out.tail" "$out/build.out"
+  fi
+  [ "$rc" = 0 ] || return 1
   tail -n 5 "$out/build.out"
   if [ ! -e "$tree/nodecode.exe" ] && [ -e "$tree/nodecode" ]; then mv "$tree/nodecode" "$tree/nodecode.exe"; fi
   [ -s "$tree/nodecode.exe" ] || { echo "ci-sogen: the build left no nodecode.exe in $tree"; return 1; }
