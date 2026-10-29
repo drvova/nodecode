@@ -1,13 +1,24 @@
+Sogen (debug, not for upstream): trace the exceptions, the spent stack, the errors
+
+For a few runs of nodecode's spike. SOGEN_TRACE_EXCEPTIONS=1 makes Sogen
+print its exception ring when a run ends; this keeps 512 instead of 32
+and prints them when the run stops on a host error too, which a guest
+that runs off its stack's end does. A stack overflow also prints the code
+addresses that occur most on the stack between the stack pointer and the
+stack's top: module+offset for loaded images, the raw address for SBCL's
+spaces. And a system call that answers with an error status is logged
+with its first three arguments, the first 20 of each call and status.
+
 diff --git a/src/windows-emulator/syscall_dispatcher.cpp b/src/windows-emulator/syscall_dispatcher.cpp
-index 56380af..6d21d5f 100644
+index 56380af..6bdee25 100644
 --- a/src/windows-emulator/syscall_dispatcher.cpp
 +++ b/src/windows-emulator/syscall_dispatcher.cpp
-@@ -115,8 +115,32 @@ namespace sogen
+@@ -115,8 +115,31 @@ namespace sogen
                  return;
              }
  
-+            // Debug (nodecode spike, not for upstream): the calls that answer with a status saying Sogen may lack
-+            // something, with what they were asked, the first 20 of each.
++            // Debug (nodecode spike, not for upstream): the calls that answer with an error, with what they were
++            // asked, the first 20 of each call and status.
 +            auto* debug_x64 = dynamic_cast<x86_64_cpu*>(&emu);
 +            const auto debug_args = debug_x64 ? std::array<uint64_t, 3>{debug_x64->reg(x86_register::r10),
 +                                                                        debug_x64->reg(x86_register::rdx),
@@ -19,8 +30,7 @@ index 56380af..6d21d5f 100644
 +            if (debug_x64 && c.write_status)
 +            {
 +                const auto status = static_cast<uint32_t>(debug_x64->reg(x86_register::rax));
-+                if (status == 0xC0000008 || status == 0xC00000BB || status == 0xC0000002 || status == 0xC000000D ||
-+                    status == 0xC0000010 || status == 0xC0000003 || status == 0xC0000024)
++                if ((status & 0xC0000000) == 0xC0000000)
 +                {
 +                    static std::map<std::pair<std::string, uint32_t>, uint32_t> seen{};
 +                    if (++seen[{entry->second.name, status}] <= 20)
