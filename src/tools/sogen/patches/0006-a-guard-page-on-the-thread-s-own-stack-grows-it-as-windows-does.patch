@@ -21,7 +21,7 @@ and TEB StackLimit follows it, or the stack is spent and the guest gets
 STATUS_STACK_OVERFLOW. Elsewhere the fault clears the guard of the faulting
 page alone, as Windows does (it used to clear a span measured from the
 faulting page but laid from the allocation's base), and is logged with the
-thread it hit, since a guest seldom survives one.
+thread it hit, since a guest seldom survives one; so is a stack overflow.
 
 diff --git a/src/emulator-platform/platform/status.hpp b/src/emulator-platform/platform/status.hpp
 index a6cb9ab..ed1a802 100644
@@ -68,7 +68,7 @@ index 6c33a83..fff0023 100644
      void dispatch_integer_division_by_zero(windows_emulator& win_emu, vcpu_context& vcpu);
      void dispatch_x87_floating_point_error(windows_emulator& win_emu, vcpu_context& vcpu);
 diff --git a/src/windows-emulator/windows_emulator.cpp b/src/windows-emulator/windows_emulator.cpp
-index 7aed3a0..9ff7728 100644
+index 7aed3a0..7d3b1d7 100644
 --- a/src/windows-emulator/windows_emulator.cpp
 +++ b/src/windows-emulator/windows_emulator.cpp
 @@ -777,6 +777,55 @@ namespace sogen
@@ -127,7 +127,7 @@ index 7aed3a0..9ff7728 100644
      }
  
      PEMachineType get_application_machine(const emulator_settings& settings, application_settings app_settings)
-@@ -1340,9 +1389,21 @@ namespace sogen
+@@ -1340,9 +1389,23 @@ namespace sogen
              auto region = this->memory.get_region_info(address);
              if (region.permissions.is_guarded())
              {
@@ -139,6 +139,8 @@ index 7aed3a0..9ff7728 100644
 +                case stack_guard_outcome::grown:
 +                    return memory_violation_continuation::restart;
 +                case stack_guard_outcome::exhausted:
++                    this->log.error("Stack overflow at 0x%llx on thread %u\n", static_cast<unsigned long long>(address),
++                                    static_cast<unsigned>(vcpu.thread().id));
 +                    dispatch_stack_overflow(*this, vcpu, address, operation);
 +                    break;
 +                case stack_guard_outcome::not_on_stack:

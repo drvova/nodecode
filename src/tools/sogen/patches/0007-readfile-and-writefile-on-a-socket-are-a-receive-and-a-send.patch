@@ -1,0 +1,254 @@
+Sogen: ReadFile and WriteFile on a socket are a receive and a send
+
+afd.sys serves a socket handle's IRP_MJ_READ and IRP_MJ_WRITE as a receive
+and a send without flags, so ReadFile and WriteFile work on a socket as on
+a file. Sogen's NtReadFile and NtWriteFile knew the console, NUL, named
+pipes and files only, and returned STATUS_INVALID_HANDLE for a socket.
+
+A runtime that treats sockets as files does all its socket I/O that way.
+SBCL does: an fd-stream over a socket reads and writes it with overlapped
+ReadFile and WriteFile, then waits on its own event. Under Sogen the first
+write on any socket failed ("Couldn't write to #<FD-STREAM for socket
+...>", from quicklisp's HTTP client): SBCL could not talk HTTP at all,
+not even to itself over loopback.
+
+A device can now name the io_control request it serves a read or a write
+as (io_device::read_write_request), and NtReadFile and NtWriteFile issue
+that request as NtDeviceIoControlFile issues one: the event reset, the
+completion port, a pending request completing later. AFD names two
+requests of its own past every one mswsock sends, and serves them with the
+transfer half of its receive and send, which now stand apart from the
+AFD_RECV_INFO and AFD_SEND_INFO parsing; a blocking socket pends until
+the host socket is ready, a non-blocking one returns
+STATUS_DEVICE_NOT_READY, as a receive or send does.
+
+diff --git a/src/windows-emulator/devices/afd_endpoint.cpp b/src/windows-emulator/devices/afd_endpoint.cpp
+index d2e2f69..bb83b53 100644
+--- a/src/windows-emulator/devices/afd_endpoint.cpp
++++ b/src/windows-emulator/devices/afd_endpoint.cpp
+@@ -430,6 +430,11 @@ namespace sogen
+             // Stream operations may complete partially, so cap staging allocations instead of trusting guest-provided WSABUF lengths.
+             static constexpr size_t max_stream_transfer_bytes = 64u << 20;
+ 
++            // Not AFD's own: the requests a socket's NtReadFile and NtWriteFile are issued as, numbered past
++            // every request mswsock sends.
++            static constexpr ULONG afd_file_read = 0x3FE;
++            static constexpr ULONG afd_file_write = 0x3FF;
++
+             std::optional<handle> event_select_event_{};
+             ULONG event_select_mask_{0};
+             ULONG triggered_events_{0};
+@@ -790,6 +795,11 @@ namespace sogen
+                 buffer.write_vector(this->pending_polls_);
+             }
+ 
++            ULONG read_write_request(const bool write) const override
++            {
++                return (FSCTL_AFD_BASE << 12) | ((write ? afd_file_write : afd_file_read) << 2);
++            }
++
+             NTSTATUS io_control(windows_emulator& win_emu, const io_device_context& c) override
+             {
+                 if (_AFD_BASE(c.io_control_code) != FSCTL_AFD_BASE)
+@@ -816,6 +826,10 @@ namespace sogen
+                     return this->ioctl_send(win_emu, c);
+                 case AFD_RECEIVE:
+                     return this->ioctl_receive(win_emu, c);
++                case afd_file_read:
++                    return this->file_read(win_emu, c);
++                case afd_file_write:
++                    return this->file_write(win_emu, c);
+                 case AFD_SEND_DATAGRAM:
+                     return this->ioctl_send_datagram(win_emu, c);
+                 case AFD_RECEIVE_DATAGRAM:
+@@ -1115,6 +1129,14 @@ namespace sogen
+                     return STATUS_INVALID_PARAMETER;
+                 }
+ 
++                return this->receive_into(win_emu, c, buffers, transfer_size);
++            }
++
++            NTSTATUS receive_into(windows_emulator& win_emu, const io_device_context& c, const std::span<const EMU_WSABUF<Traits>> buffers,
++                                  const size_t transfer_size)
++            {
++                auto& emu = win_emu.emu();
++
+                 std::vector<std::byte> host_buffer;
+                 host_buffer.resize(transfer_size);
+ 
+@@ -1205,6 +1227,11 @@ namespace sogen
+                     }
+                 }
+ 
++                return this->send_from(win_emu, c, host_buffer);
++            }
++
++            NTSTATUS send_from(windows_emulator& win_emu, const io_device_context& c, const std::span<const std::byte> host_buffer)
++            {
+                 if (host_buffer.empty())
+                 {
+                     if (c.io_status_block)
+@@ -1242,6 +1269,48 @@ namespace sogen
+                 return STATUS_SUCCESS;
+             }
+ 
++            // afd.sys serves a socket's IRP_MJ_READ and IRP_MJ_WRITE as a receive and a send without flags, so
++            // ReadFile and WriteFile work on a socket handle; runtimes that treat sockets as files do all their
++            // socket I/O that way (SBCL, for one).
++            NTSTATUS file_read(windows_emulator& win_emu, const io_device_context& c)
++            {
++                if (!this->s_)
++                {
++                    throw std::runtime_error("Invalid AFD endpoint socket!");
++                }
++
++                if (c.output_buffer_length == 0)
++                {
++                    if (c.io_status_block)
++                    {
++                        c.io_status_block.write({});
++                    }
++                    return STATUS_SUCCESS;
++                }
++
++                EMU_WSABUF<Traits> buffer{};
++                buffer.len = c.output_buffer_length;
++                buffer.buf = static_cast<decltype(buffer.buf)>(c.output_buffer);
++                return this->receive_into(win_emu, c, std::span{&buffer, 1},
++                                          std::min<size_t>(buffer.len, max_stream_transfer_bytes));
++            }
++
++            NTSTATUS file_write(windows_emulator& win_emu, const io_device_context& c)
++            {
++                if (!this->s_)
++                {
++                    throw std::runtime_error("Invalid AFD endpoint socket!");
++                }
++
++                std::vector<std::byte> host_buffer(std::min<size_t>(c.input_buffer_length, max_stream_transfer_bytes));
++                if (!host_buffer.empty())
++                {
++                    win_emu.emu().read_memory(c.input_buffer, host_buffer.data(), host_buffer.size());
++                }
++
++                return this->send_from(win_emu, c, host_buffer);
++            }
++
+             static std::vector<const afd_endpoint*> resolve_endpoints(windows_emulator& win_emu,
+                                                                       const std::span<const AFD_POLL_HANDLE_INFO<Traits>> handles)
+             {
+diff --git a/src/windows-emulator/io_device.hpp b/src/windows-emulator/io_device.hpp
+index 1a5fdfd..a3426c9 100644
+--- a/src/windows-emulator/io_device.hpp
++++ b/src/windows-emulator/io_device.hpp
+@@ -149,6 +149,13 @@ namespace sogen
+             return context;
+         }
+ 
++        // The io_control request this device serves NtWriteFile (write) or NtReadFile as, the caller's buffer
++        // its input (write) or output buffer, or 0 for a device that has no read or write of its own.
++        virtual ULONG read_write_request(const bool /*write*/) const
++        {
++            return 0;
++        }
++
+         static void queue_io_completion(windows_emulator& win_emu, const io_device_context& context);
+ 
+         virtual void release_references(process_context& process)
+@@ -277,6 +284,13 @@ namespace sogen
+         bool suspends_at_frame_end() const override;
+         NTSTATUS io_control(windows_emulator& win_emu, const io_device_context& context) override;
+         io_device_context prepare_io_context(const io_device_context& context) const override;
++
++        ULONG read_write_request(const bool write) const override
++        {
++            this->assert_validity();
++            return this->file_->device->read_write_request(write);
++        }
++
+         bool cancel_io(windows_emulator& win_emu, uint64_t io_status_block, std::optional<uint32_t> issuing_thread_id = {}) override;
+         bool has_pending_io(uint32_t issuing_thread_id) const override;
+         NTSTATUS set_completion_association(process_context& process, const emulator_thread* active_thread, handle completion_port,
+diff --git a/src/windows-emulator/syscalls/file.cpp b/src/windows-emulator/syscalls/file.cpp
+index 3094198..12aa141 100644
+--- a/src/windows-emulator/syscalls/file.cpp
++++ b/src/windows-emulator/syscalls/file.cpp
+@@ -1433,6 +1433,52 @@ namespace sogen
+             return pipe->start_io(c.win_emu, container->prepare_io_context(context), reading);
+         }
+ 
++        // A read or write of a device that serves one as a request of its own (a socket's, for AFD), issued as
++        // NtDeviceIoControlFile issues a request; nothing when the device has no read or write.
++        std::optional<NTSTATUS> handle_device_read_write(const syscall_context& c, const handle file_handle, const uint64_t event,
++                                                         const uint64_t apc_routine, const uint64_t apc_context,
++                                                         const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
++                                                         const uint64_t wow64_io_status_block, const uint64_t buffer,
++                                                         const ULONG length, const bool write)
++        {
++            auto* device = c.proc.devices.get(file_handle);
++            const auto request = device ? device->read_write_request(write) : 0;
++            if (!request)
++            {
++                return std::nullopt;
++            }
++
++            if (auto* e = c.proc.events.get(make_handle(event)))
++            {
++                e->signaled = false;
++            }
++
++            io_device_context context{c.emu};
++            context.source_handle = file_handle;
++            context.event = make_handle(event);
++            context.apc_routine = apc_routine;
++            context.apc_context = apc_context;
++            context.io_status_block = io_status_block;
++            context.io_control_code = request;
++            if (write)
++            {
++                context.input_buffer = buffer;
++                context.input_buffer_length = length;
++            }
++            else
++            {
++                context.output_buffer = buffer;
++                context.output_buffer_length = length;
++            }
++            context.vcpu = &c.vcpu;
++            if (wow64_io_status_block)
++            {
++                context.wow64_io_status_block.set_address(wow64_io_status_block);
++            }
++
++            return device->execute_ioctl(c.win_emu, context);
++        }
++
+         NTSTATUS handle_NtReadFile(const syscall_context& c, const handle file_handle, const uint64_t event, const uint64_t apc_routine,
+                                    const uint64_t apc_context,
+                                    const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, const uint64_t buffer,
+@@ -1469,6 +1515,12 @@ namespace sogen
+                                       length, true);
+             }
+ 
++            if (const auto status = handle_device_read_write(c, file_handle, event, apc_routine, apc_context, io_status_block,
++                                                             wow64_io_status_block, buffer, length, false))
++            {
++                return *status;
++            }
++
+             const auto* f = c.proc.files.get(file_handle);
+             if (!f)
+             {
+@@ -1672,6 +1724,12 @@ namespace sogen
+                                       length, false);
+             }
+ 
++            if (const auto status = handle_device_read_write(c, file_handle, event, apc_routine, apc_context, io_status_block,
++                                                             wow64_io_status_block, buffer, length, true))
++            {
++                return *status;
++            }
++
+             const auto* f = c.proc.files.get(file_handle);
+             if (!f)
+             {
