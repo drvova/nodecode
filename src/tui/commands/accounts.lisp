@@ -274,7 +274,13 @@ start on: POST /api/gateway/sessions/<id>/effort (SET-SESSION-EFFORT)."
                       :control "~a: ~a")
     (bind (((provider model-id ladder facts) (target-snapshot model))
            (tokens (split-words (or args "")))
-           (value (unless (string-equal "default" (first tokens)) (first tokens))))
+           (value (cond ((string-equal "default" (first tokens)) nil)
+                        ;; `next': the rung after the current one, wrapping.
+                        ((string-equal "next" (first tokens))
+                         (nth (mod (1+ (or (position (getf facts :effort) ladder :test #'equal) -1))
+                                   (max 1 (length ladder)))
+                              ladder))
+                        (t (first tokens)))))
       (cond
         ((null ladder) "No reasoning control is available for this model.")
         ((> (length tokens) 1) (slash-unoffered "think"))

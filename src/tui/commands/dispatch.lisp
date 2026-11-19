@@ -1533,7 +1533,9 @@ ended on (SETUP-ISSUE-SEGS) lead each and are shed last."
                             (list (part profile (cons :command "profiles"))))
                           (when (plusp (length workspace))
                             (append (and profile (list separator))
-                                    (list (part workspace (file-uri (workspace-directory))))))))
+                                    (list (part workspace (file-uri (workspace-directory))))
+                                    (when-let (branch (git-branch-label))
+                                      (list (make-seg :text (format nil " ⎇ ~a" (clip-text-to-width branch 24)) :tone :user)))))))
              ;; The setup walk names no gateway before an endpoint means anything.
              (candidates
                (if (and port (not model.setup-walk))

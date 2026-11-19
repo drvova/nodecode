@@ -63,6 +63,51 @@ DEADLINE-MS."
   (nlk:wait-until (lambda () (> *frames-on-screen* count))
                   (nlk:deadline-after (/ deadline-ms 1000)) 0.001))
 
+(defun row-keys (buffer &aux (w buffer.width))
+  "A fixnum per row of BUFFER, its last column (the scroll gutter) left out."
+  (let ((keys (make-array buffer.height)))
+    (dotimes (y buffer.height keys)
+      (let ((h 0))
+        (declare (fixnum h))
+        (dotimes (x (1- w))
+          (let ((cell (screen-buffer-ref buffer x y)))
+            (setf h (logand most-positive-fixnum
+                            (+ (* h 31) (char-code cell.char) (sxhash cell.fg) (* 7 (sxhash cell.bg)) cell.attrs)))))
+        (setf (aref keys y) h)))))
+
+(defun scroll-band (old new stream &aux (h new.height) (ka (row-keys old)) (kb (row-keys new)) best (gain 2))
+  "omp's row move: when NEW's rows are OLD's shifted, scroll the band with the
+terminal and shift OLD to match, so the diff after it repaints only what changed."
+  ;; An optimization only: the diff that follows compares against the shifted
+  ;; OLD, so a key collision costs bytes, never a wrong cell. Row 0 never
+  ;; moves (Terminal.app archives a top row a scroll deletes into scrollback).
+  (loop for shift in (loop for d from 1 below (floor h 2) collect d collect (- d))
+        do (loop with start = nil and saved = 0
+                 for y from 1 to h
+                 for hit = (and (< y h) (< 0 (+ y shift) h) (= (aref kb y) (aref ka (+ y shift))))
+                 do (cond (hit (unless start (setf start y saved 0))
+                               (unless (= (aref kb y) (aref ka y)) (incf saved)))
+                          (start (when (> saved gain)
+                                   (setf gain saved best (list shift start (1- y))))
+                                 (setf start nil)))))
+  (when best
+    (destructuring-bind (shift first last) best
+      (let* ((d (abs shift))
+             (top (if (plusp shift) first (- first d)))
+             (bot (if (plusp shift) (+ last d) last)))
+        (format stream "~C[0m~C[~D;~Dr~C[~D~C~C[r" #\Escape #\Escape (1+ top) (1+ bot)
+                #\Escape d (if (plusp shift) #\S #\T) #\Escape)
+        (flet ((move-row (to from)
+                 (dotimes (x old.width)
+                   (let ((lead (and from (screen-buffer-ref old x from))))
+                     (if lead
+                         (set-cell (screen-buffer-ref old x to) lead.char lead.width lead.fg lead.bg lead.attrs lead.link)
+                         (set-cell (screen-buffer-ref old x to) #\Space 1 nil nil 0 nil))))))
+          (if (plusp shift)
+              (loop for y from top to bot do (move-row y (and (<= (+ y d) bot) (+ y d))))
+              (loop for y from bot downto top do (move-row y (and (>= (- y d) top) (- y d))))))
+        t))))
+
 (defun render (renderer view &aux (stream renderer.output-stream)
                                   (width renderer.width)
                                   (height renderer.height))
@@ -104,6 +149,8 @@ DEADLINE-MS."
     ;; reached from where the paint left off -- a typed key ends its paint
     ;; right at the caret, and costs no motion at all.
     (format stream "~C[?2026h~C[?25l" #\Escape #\Escape)
+    (when (and renderer.last-buffer (null renderer.last-images) (null view.images))
+      (scroll-band renderer.last-buffer new stream))
     (multiple-value-bind (x y damaged)
         (let ((damaged (damaged-sixels renderer.last-buffer new renderer.last-images view.images)))
           (multiple-value-bind (x y)

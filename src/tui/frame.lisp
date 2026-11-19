@@ -177,6 +177,11 @@ from the ones COLLECT-DURING-WAIT hid inside provider wait."
            ;; exactly as the slash command's does (SUBMIT-SLASH's contract);
            ;; on the gateway shell the directory read runs on its own thread,
            ;; so no frame waits for it.
+           ((model-key-matches-p model :cycle-effort key mod)
+            (when-let (notice (slash-think-op model "next"))
+              (show-status model notice)
+              (render-state model)))
+
            ((model-key-matches-p model :sessions-dialog key mod)
             (when-let (notice (slash-sessions-op model))
               (show-status model notice)
@@ -672,6 +677,33 @@ rule): `~/src/thing`, bare `~` at home, the trimmed path elsewhere."
       (setf *workspace-footer-label*
             (home-abbreviated (namestring (uiop:getcwd))))))
 
+(defvar *git-branch-memo* nil
+  "(UNIVERSAL-TIME . BRANCH) of the last .git/HEAD read GIT-BRANCH-LABEL made.")
+
+(defun git-branch-label (&aux (now (get-universal-time)) (memo *git-branch-memo*))
+  "The cwd's checked-out branch, a detached HEAD's short hash, or NIL (omp's
+⎇ segment): .git/HEAD read at most every two seconds, never a subprocess."
+  (cdr (if (and memo (< (- now (car memo)) 2))
+           memo
+           (setf *git-branch-memo*
+                 (cons now (ignore-errors
+                            (loop for dir = (uiop:getcwd) then (uiop:pathname-parent-directory-pathname dir)
+                                  for git = (merge-pathnames ".git/" dir)
+                                  for link = (and (not (uiop:directory-exists-p git))
+                                                  (probe-file (merge-pathnames ".git" dir))
+                                                  (uiop:read-file-line (merge-pathnames ".git" dir)))
+                                  for head = (cond ((uiop:directory-exists-p git) (merge-pathnames "HEAD" git))
+                                                   ((and link (prefix-at-p link 0 "gitdir: "))
+                                                    (merge-pathnames "HEAD" (uiop:ensure-directory-pathname
+                                                                             (merge-pathnames (subseq link 8) dir)))))
+                                  repeat 64
+                                  when head
+                                    return (let ((line (uiop:read-file-line head)))
+                                             (if (prefix-at-p line 0 "ref: refs/heads/")
+                                                 (subseq line 16)
+                                                 (subseq line 0 (min 7 (length line)))))
+                                  until (equal dir (uiop:pathname-parent-directory-pathname dir)))))))))
+
 (defun forget-workspace-memos ()
   "Drop both cwd memos — the footer's label and the directory a clicked
 relative path resolves against — so no dumped image carries the BUILD directory's
@@ -683,7 +715,8 @@ tree) in its footer on every box, forever."
   ;; not the builder's. Rides *SAVE-HOOKS* beside THEME's FORGET-COLOR-PROFILE
   ;; and NLT's FORGET-TERMINAL.
   (setf *workspace-footer-label* nil
-        *workspace-directory* nil))
+        *workspace-directory* nil
+        *git-branch-memo* nil))
 
 (pushnew 'forget-workspace-memos sb-ext:*save-hooks*)
 

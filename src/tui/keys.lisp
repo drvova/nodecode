@@ -223,6 +223,8 @@ names too (PAINT-KEYS)."
     ;; is its search, so a letter cannot open the name field.
     (:rename "Rename the highlighted session in the sessions picker" ("f2"))
     (:toggle-viewport "Switch Developer / Standard viewport" ("ctrl+o"))
+    ;; omp's effort key (pi, prime, Claude Code's mode key): /think next.
+    (:cycle-effort "Cycle reasoning effort" ("shift+tab"))
     ;; Ctrl+F while a dialog is open: the docked panel takes every row the
     ;; window can give it (TOGGLE-DIALOG-FULLSCREEN). Zig binds the chord to
     ;; the session tree's fork, a surface with no lisp backend, so it is free.
