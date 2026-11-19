@@ -342,8 +342,10 @@
                 (setf (nle::chat-model-hover-target model) nil)
                 (let* ((bg (nle::canvas-fill-bg))
                        (row (nle::footer-frame-row model 220 bg))
-                       (expected (nle::seg-render (nle::make-seg :text text :tone :muted :link target) bg)))
-                  (is (search expected row) "unhovered links return to muted paint"))))))))))
+                       (expected (nle::seg-render (nle::make-seg :text text :link target
+                                                                    :tone (if (equal text " (high)") :session-title :muted))
+                                                     bg)))
+                  (is (search expected row) "unhovered links return to their own paint: high effort its accent"))))))))))
 
 (deftest footer-gateway-links-to-the-web-sessions ()
   (with-frame-model (model 220 30 :session-id "gateway-sessions" :http-port 38935)

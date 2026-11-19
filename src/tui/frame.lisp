@@ -538,8 +538,8 @@ cost and how full its context is; Standard keeps context and cache hit rate, Dev
   "The occupancy as five cells (omp's context meter), NIL with no window or prompt."
   ;; Painted only, never in HEADER-STATUS-TEXT: the same number drawn, not a second one.
   (when (and (getf context :model) window (plusp window) (plusp used))
-    (let ((filled (min 5 (ceiling (* 5 used) window))))
-      (format nil "~a~a " (make-string filled :initial-element #\▰) (make-string (- 5 filled) :initial-element #\▱)))))
+    (let ((filled (max 1 (min 5 (round (* 5 used) window)))))
+      (format nil "~a~a " (make-string filled :initial-element #\━) (make-string (- 5 filled) :initial-element #\─)))))
 
 (defun header-status-segs (model &aux (parts (header-status-parts model))
                                    (gauge (and parts (header-context-gauge model))))
