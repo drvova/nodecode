@@ -532,12 +532,23 @@ cost and how full its context is; Standard keeps context and cache hit rate, Dev
   (let ((parts (header-status-parts model :detail detail)))
     (and parts (format nil "~{~a~^ · ~}" (mapcar #'car parts)))))
 
-(defun header-status-segs (model)
-  "HEADER-STATUS-TEXT as the header row paints it: each part in its tone,
-the gutters muted."
-  (loop for ((text . tone) . more) on (header-status-parts model)
-        collect (make-seg :text text :tone tone)
-        when more collect (make-seg :text " · " :tone :muted)))
+(defun header-context-gauge (model &aux (context (json-value (visible-transcript-state model) :any "context_usage"))
+                                     (used (context-occupancy-tokens context))
+                                     (window (ignore-errors (model-context-tokens (getf context :model)))))
+  "The occupancy as five cells (omp's context meter), NIL with no window or prompt."
+  ;; Painted only, never in HEADER-STATUS-TEXT: the same number drawn, not a second one.
+  (when (and (getf context :model) window (plusp window) (plusp used))
+    (let ((filled (min 5 (ceiling (* 5 used) window))))
+      (format nil "~a~a " (make-string filled :initial-element #\▰) (make-string (- 5 filled) :initial-element #\▱)))))
+
+(defun header-status-segs (model &aux (parts (header-status-parts model))
+                                   (gauge (and parts (header-context-gauge model))))
+  "HEADER-STATUS-TEXT as the header row paints it: the context gauge in the
+occupancy's tone, each part in its tone, the gutters muted."
+  (append (and gauge (list (make-seg :text gauge :tone (cdr (first parts)))))
+          (loop for ((text . tone) . more) on parts
+                collect (make-seg :text text :tone tone)
+                when more collect (make-seg :text " · " :tone :muted))))
 
 (defun header-status-parts (model &key (detail (chat-model-tool-detail model)))
   "The header's right lane as (TEXT . TONE) parts, NIL before any usage
@@ -709,7 +720,13 @@ Segments are the one authority for text, color, clipping and target ranges."
                          (append (and identity (list (hover-seg model identity (cons :command "models")
                                                                 (or (connection-identity-tone model) :muted))))
                                  (when-let (effort (and provider model-id (footer-reasoning-effort model)))
-                                   (list (action (format nil " (~a)" effort) "think")))
+                                   ;; Tinted by level, auto by its rung (omp's effort tint).
+                                   (list (hover-seg model (format nil " (~a)" effort) (cons :command "think")
+                                                    (let* ((effort (princ-to-string effort))
+                                                           (rung (subseq effort (1+ (or (position #\Space effort :from-end t) -1)))))
+                                                      (cond ((member rung '("xhigh" "max") :test #'string-equal) :warn)
+                                                            ((string-equal rung "high") :session-title)
+                                                            (t :muted))))))
                                  (list (make-seg :text " · " :tone :muted)
                                        (action (footer-gesture-hint model) "sessions")))))
                (right (find-if (lambda (candidate)
@@ -1150,7 +1167,7 @@ footer, and the final blank; short windows end with two blank rows."
          ;; The header: title, Developer-only dimmed session id, usage lane.
          ;; Home and setup yield the identity; Standard has no raw-id fallback.
          (status (header-status-text model))
-         (status-width (if status (text-display-width status) 0))
+         (status-width (if status (+ (text-display-width status) (length (or (header-context-gauge model) ""))) 0))
          (fits (and status (<= (+ 3 4 2 status-width 3) width)))
          (header-row
            (if (or (home-screen-p model) (chat-model-setup-walk model))
